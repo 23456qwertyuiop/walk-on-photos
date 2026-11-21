@@ -9,7 +9,8 @@ import '../scene/image_utils.dart';
 import '../scene/photo_scene.dart';
 import '../scene/scene_builder.dart';
 
-/// Photo -> AI depth -> layered 3D scene, with progress for the UI.
+/// Photo -> AI depth -> layered 3D scene, with lightweight preview image
+/// for the fly-in transition animation.
 class SceneLoader extends ChangeNotifier {
   SceneLoader() {
     // Load the model in the background so the first photo is quicker.
@@ -20,13 +21,18 @@ class SceneLoader extends ChangeNotifier {
   final ImagePicker _picker = ImagePicker();
 
   PhotoScene? scene;
-  String? stage;
+  ui.Image? _previewPhoto;
+  bool _busy = false;
+  int _sceneVersion = 0;
   String? error;
-  bool get busy => stage != null;
+
+  bool get busy => _busy;
+  ui.Image? get previewPhoto => _previewPhoto;
+  int get sceneVersion => _sceneVersion;
 
   /// Opens the gallery / file chooser. Returns true if a new scene was built.
   Future<bool> pickAndBuild() async {
-    if (busy) return false;
+    if (_busy) return false;
     final XFile? file = await _picker.pickImage(source: ImageSource.gallery);
     if (file == null) return false;
     return buildFromBytes(await file.readAsBytes());
@@ -34,15 +40,23 @@ class SceneLoader extends ChangeNotifier {
 
   Future<bool> buildFromBytes(Uint8List bytes) async {
     error = null;
+    _busy = true;
+    notifyListeners();
+
     ui.Image? photo;
     try {
-      _setStage('读取照片…');
       photo = await decodePhoto(bytes);
 
-      _setStage('AI 估算深度（Depth Anything V2）…');
-      final DepthMap depth = await _estimator.estimate(photo);
+      // Expose a resized preview immediately so the fly-in animation can
+      // start assembling pieces on screen while depth & 3D mesh compute.
+      final ui.Image preview = await resizeImage(photo, 640);
+      final ui.Image? oldPreview = _previewPhoto;
+      _previewPhoto = preview;
+      _sceneVersion++;
+      notifyListeners();
+      oldPreview?.dispose();
 
-      _setStage('重建 3D 空间、生成特征色彩粒子…');
+      final DepthMap depth = await _estimator.estimate(photo);
       final PhotoScene built = await SceneBuilder.build(photo, depth);
 
       final PhotoScene? old = scene;
@@ -55,19 +69,15 @@ class SceneLoader extends ChangeNotifier {
       return false;
     } finally {
       photo?.dispose();
-      stage = null;
+      _busy = false;
       notifyListeners();
     }
-  }
-
-  void _setStage(String s) {
-    stage = s;
-    notifyListeners();
   }
 
   @override
   void dispose() {
     scene?.dispose();
+    _previewPhoto?.dispose();
     _estimator.dispose();
     super.dispose();
   }

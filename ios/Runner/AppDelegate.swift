@@ -118,10 +118,11 @@ final class ArPhotoView: NSObject, FlutterPlatformView, ARSessionDelegate {
       }
       let root = SCNNode()
       for layer in layers {
-        if let node = makeNode(layer) { root.addChildNode(node) }
+        for node in makeForegroundTiles(layer) { root.addChildNode(node) }
       }
       if let particles = args["particles"] as? [String: Any],
          let pNode = makeParticleNode(particles) {
+        pNode.name = "particles"
         root.addChildNode(pNode)
       }
       sceneRoot?.removeFromParentNode()
@@ -142,15 +143,18 @@ final class ArPhotoView: NSObject, FlutterPlatformView, ARSessionDelegate {
     }
   }
 
-  private func makeNode(_ layer: [String: Any]) -> SCNNode? {
+  private func makeForegroundTiles(_ layer: [String: Any]) -> [SCNNode] {
     guard let pos = (layer["positions"] as? FlutterStandardTypedData)?.data,
       let uv = (layer["uvs"] as? FlutterStandardTypedData)?.data,
       let idx = (layer["indices"] as? FlutterStandardTypedData)?.data,
       let png = (layer["texture"] as? FlutterStandardTypedData)?.data,
       let image = UIImage(data: png)
-    else { return nil }
+    else { return [] }
 
     let vertexCount = pos.count / 12
+    let triCount = idx.count / 12
+    guard vertexCount > 0, triCount > 0 else { return [] }
+
     let vertices = SCNGeometrySource(
       data: pos, semantic: .vertex, vectorCount: vertexCount,
       usesFloatComponents: true, componentsPerVector: 3,
@@ -161,11 +165,7 @@ final class ArPhotoView: NSObject, FlutterPlatformView, ARSessionDelegate {
       data: uv, semantic: .texcoord, vectorCount: vertexCount,
       usesFloatComponents: true, componentsPerVector: 2,
       bytesPerComponent: 4, dataOffset: 0, dataStride: 8)
-    let element = SCNGeometryElement(
-      data: idx, primitiveType: .triangles,
-      primitiveCount: idx.count / 12, bytesPerIndex: 4)
 
-    let geometry = SCNGeometry(sources: [vertices, texcoords], elements: [element])
     let material = SCNMaterial()
     material.diffuse.contents = image
     material.diffuse.wrapS = .clamp
@@ -175,10 +175,47 @@ final class ArPhotoView: NSObject, FlutterPlatformView, ARSessionDelegate {
     material.diffuse.mipFilter = .linear
     material.lightingModel = .constant
     material.isDoubleSided = true
-    geometry.materials = [material]
 
-    let node = SCNNode(geometry: geometry)
-    return node
+    var uvFloats = [Float](repeating: 0, count: vertexCount * 2)
+    uvFloats.withUnsafeMutableBytes { dst in
+      uv.copyBytes(to: dst)
+    }
+    var idxInts = [Int32](repeating: 0, count: triCount * 3)
+    idxInts.withUnsafeMutableBytes { dst in
+      idx.copyBytes(to: dst)
+    }
+
+    let cols = 6
+    let rows = 8
+    var buckets = [[Int32]](repeating: [], count: cols * rows)
+    for t in 0..<triCount {
+      let a = Int(idxInts[t * 3])
+      let b = Int(idxInts[t * 3 + 1])
+      let c = Int(idxInts[t * 3 + 2])
+      let avgU = (uvFloats[a * 2] + uvFloats[b * 2] + uvFloats[c * 2]) / 3.0
+      let avgV = (uvFloats[a * 2 + 1] + uvFloats[b * 2 + 1] + uvFloats[c * 2 + 1]) / 3.0
+      let col = min(cols - 1, max(0, Int(avgU * Float(cols))))
+      let row = min(rows - 1, max(0, Int(avgV * Float(rows))))
+      buckets[row * cols + col].append(contentsOf: [Int32(a), Int32(b), Int32(c)])
+    }
+
+    var nodes: [SCNNode] = []
+    for row in 0..<rows {
+      for col in 0..<cols {
+        let tileIndices = buckets[row * cols + col]
+        if tileIndices.isEmpty { continue }
+        let elemData = tileIndices.withUnsafeBytes { Data($0) }
+        let element = SCNGeometryElement(
+          data: elemData, primitiveType: .triangles,
+          primitiveCount: tileIndices.count / 3, bytesPerIndex: 4)
+        let geometry = SCNGeometry(sources: [vertices, texcoords], elements: [element])
+        geometry.materials = [material]
+        let node = SCNNode(geometry: geometry)
+        node.name = "tile_\(col)_\(row)"
+        nodes.append(node)
+      }
+    }
+    return nodes
   }
 
   private static let particleSprite: UIImage = {
@@ -336,7 +373,40 @@ final class ArPhotoView: NSObject, FlutterPlatformView, ARSessionDelegate {
     root.simdPosition = SIMD3<Float>(t.columns.3.x, t.columns.3.y, t.columns.3.z)
     root.simdOrientation = simd_quatf(angle: yaw, axis: SIMD3<Float>(0, 1, 0))
     if root.parent == nil { sceneView.scene.rootNode.addChildNode(root) }
+    animateFlyIn(root)
     channel.invokeMethod("onPlaced", arguments: nil)
+  }
+
+  private func animateFlyIn(_ root: SCNNode) {
+    for child in root.childNodes {
+      child.removeAllActions()
+      if let name = child.name, name.hasPrefix("tile_") {
+        let parts = name.split(separator: "_")
+        if parts.count == 3, let col = Int(parts[1]), let row = Int(parts[2]) {
+          let dx = (Float(col) - 2.5) * 0.16
+          let dy = (3.5 - Float(row)) * 0.16
+          let jitter = Float((col * 17 + row * 31) % 7) * 0.06
+          child.opacity = 0.0
+          child.simdPosition = SIMD3<Float>(dx, dy, -0.7 - jitter)
+
+          let dist = sqrtf(powf(Float(col) - 2.5, 2) + powf(Float(row) - 3.5, 2)) / 4.3
+          let delay = Double(dist) * 0.35 + Double((col * 7 + row * 13) % 5) * 0.03
+          let fly = SCNAction.group([
+            SCNAction.fadeIn(duration: 0.38),
+            SCNAction.move(to: SCNVector3Zero, duration: 0.48),
+          ])
+          fly.timingMode = .easeOut
+          child.runAction(SCNAction.sequence([SCNAction.wait(duration: delay), fly]))
+          continue
+        }
+      }
+      if child.name == "particles" {
+        child.opacity = 0.0
+        let fade = SCNAction.fadeIn(duration: 0.55)
+        fade.timingMode = .easeOut
+        child.runAction(SCNAction.sequence([SCNAction.wait(duration: 0.30), fade]))
+      }
+    }
   }
 
   // MARK: ARSessionDelegate (delivered on the main queue)

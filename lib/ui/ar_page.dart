@@ -96,14 +96,18 @@ class _ArPageState extends State<ArPage> with WidgetsBindingObserver {
                       ],
                     ),
                   ),
-                if (_ar != null)
+                if (_ar != null && !loader.busy)
                   Positioned(
                     bottom: pad.bottom + 24,
                     left: 16,
                     right: 16,
                     child: Center(child: _status(loader)),
                   ),
-                if (loader.busy) BusyOverlay(loader.stage!),
+                PhotoFlyInOverlay(
+                  image: loader.previewPhoto,
+                  busy: loader.busy,
+                  version: loader.sceneVersion,
+                ),
               ],
             );
           },

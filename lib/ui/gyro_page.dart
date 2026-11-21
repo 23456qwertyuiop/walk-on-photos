@@ -143,7 +143,7 @@ class _GyroPageState extends State<GyroPage>
                   error: loader.error,
                   onPick: _pick,
                 ),
-              if (loader.scene != null) ...<Widget>[
+              if (loader.scene != null && !loader.busy) ...<Widget>[
                 Positioned(
                   top: pad.top + 12,
                   left: 12,
@@ -176,7 +176,11 @@ class _GyroPageState extends State<GyroPage>
                   child: const HintBubble('转动手机看四周\n摇杆走动'),
                 ),
               ],
-              if (loader.busy) BusyOverlay(loader.stage!),
+              PhotoFlyInOverlay(
+                image: loader.previewPhoto,
+                busy: loader.busy,
+                version: loader.sceneVersion,
+              ),
             ],
           ),
         );

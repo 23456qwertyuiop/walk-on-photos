@@ -1,3 +1,6 @@
+import 'dart:math' as math;
+import 'dart:ui' as ui;
+
 import 'package:material_ui/material_ui.dart';
 
 const Color kAccent = Color(0xFF7FE7D9);
@@ -145,27 +148,259 @@ class AddPhotoCard extends StatelessWidget {
   }
 }
 
-class BusyOverlay extends StatelessWidget {
-  const BusyOverlay(this.stage, {super.key});
+/// Animates the chosen photo flying piece-by-piece into the frame while the
+/// 3D scene is being reconstructed (no spinner or loading text).
+class PhotoFlyInOverlay extends StatefulWidget {
+  const PhotoFlyInOverlay({
+    super.key,
+    required this.image,
+    required this.busy,
+    required this.version,
+  });
 
-  final String stage;
+  final ui.Image? image;
+  final bool busy;
+  final int version;
+
+  @override
+  State<PhotoFlyInOverlay> createState() => _PhotoFlyInOverlayState();
+}
+
+class _PhotoFlyInOverlayState extends State<PhotoFlyInOverlay>
+    with TickerProviderStateMixin {
+  late final AnimationController _flyCtrl;
+  late final AnimationController _fadeCtrl;
+  bool _active = false;
+  ui.Image? _shownImage;
+
+  @override
+  void initState() {
+    super.initState();
+    _flyCtrl = AnimationController(vsync: this);
+    _fadeCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 240),
+      value: 0.0,
+    );
+    _syncState();
+  }
+
+  @override
+  void didUpdateWidget(covariant PhotoFlyInOverlay oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.version != oldWidget.version ||
+        widget.busy != oldWidget.busy ||
+        widget.image != oldWidget.image) {
+      _syncState(oldBusy: oldWidget.busy, oldVersion: oldWidget.version);
+    }
+  }
+
+  void _syncState({bool oldBusy = false, int oldVersion = -1}) {
+    if (widget.busy) {
+      if (widget.image != null &&
+          (!_active || widget.version != oldVersion || !oldBusy)) {
+        _active = true;
+        _shownImage = widget.image;
+        _fadeCtrl.value = 1.0;
+        _flyCtrl.stop();
+        _flyCtrl.value = 0.0;
+        // Fly ~86% of tiles in over 1.35s, then drift slowly toward 96% if
+        // model inference is still running on slower devices.
+        _flyCtrl
+            .animateTo(
+              0.86,
+              duration: const Duration(milliseconds: 1350),
+              curve: Curves.easeOutQuad,
+            )
+            .then((_) {
+              if (mounted && widget.busy) {
+                _flyCtrl.animateTo(
+                  0.96,
+                  duration: const Duration(milliseconds: 3000),
+                  curve: Curves.linear,
+                );
+              }
+            });
+      }
+    } else if (_active) {
+      // Scene finished building: snap remaining tiles into place, then dissolve
+      // smoothly into the live 3D scene.
+      _flyCtrl
+          .animateTo(
+            1.0,
+            duration: const Duration(milliseconds: 260),
+            curve: Curves.easeOutCubic,
+          )
+          .then((_) {
+            if (!mounted || widget.busy) return;
+            _fadeCtrl.reverse().then((_) {
+              if (mounted && !widget.busy) {
+                setState(() {
+                  _active = false;
+                  _shownImage = null;
+                });
+              }
+            });
+          });
+    }
+  }
+
+  @override
+  void dispose() {
+    _flyCtrl.dispose();
+    _fadeCtrl.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
-    return ColoredBox(
-      color: Colors.black54,
-      child: Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: <Widget>[
-            const CircularProgressIndicator(color: kAccent),
-            const SizedBox(height: 14),
-            Text(stage, style: const TextStyle(color: Colors.white)),
-          ],
-        ),
+    final ui.Image? img = _shownImage ?? widget.image;
+    if (!_active || img == null) return const SizedBox.shrink();
+
+    return IgnorePointer(
+      child: AnimatedBuilder(
+        animation: Listenable.merge(<Listenable>[_flyCtrl, _fadeCtrl]),
+        builder: (BuildContext context, _) {
+          if (_fadeCtrl.value <= 0.001) return const SizedBox.shrink();
+          return CustomPaint(
+            painter: _PhotoFlyInPainter(
+              image: img,
+              progress: _flyCtrl.value,
+              masterOpacity: _fadeCtrl.value,
+            ),
+            size: Size.infinite,
+          );
+        },
       ),
     );
   }
+}
+
+class _PhotoFlyInPainter extends CustomPainter {
+  _PhotoFlyInPainter({
+    required this.image,
+    required this.progress,
+    required this.masterOpacity,
+  });
+
+  final ui.Image image;
+  final double progress;
+  final double masterOpacity;
+
+  static double _hash01(int a, int b, int c) {
+    int h = a * 374761393 + b * 668265263 + c * 2147483647;
+    h = (h ^ (h >> 13)) * 1274126177;
+    h ^= (h >> 16);
+    return (h & 0x00FFFFFF) / 16777216.0;
+  }
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (size.isEmpty || masterOpacity <= 0.0) return;
+
+    final double iw = image.width.toDouble();
+    final double ih = image.height.toDouble();
+    // Cover-fit rectangle matching ScenePainter's starting camera projection.
+    final double cover = math.max(size.width / iw, size.height / ih);
+    final double dstW = iw * cover;
+    final double dstH = ih * cover;
+    final double ox = (size.width - dstW) * 0.5;
+    final double oy = (size.height - dstH) * 0.5;
+    final double screenCx = size.width * 0.5;
+    final double screenCy = size.height * 0.5;
+
+    final bool landscape = iw >= ih;
+    const int longTiles = 18;
+    final int cols = landscape
+        ? longTiles
+        : math.max(8, (longTiles * iw / ih).round());
+    final int rows = landscape
+        ? math.max(8, (longTiles * ih / iw).round())
+        : longTiles;
+
+    final double srcTileW = iw / cols;
+    final double srcTileH = ih / rows;
+    final double dstTileW = dstW / cols;
+    final double dstTileH = dstH / rows;
+
+    final Paint tilePaint = Paint()..filterQuality = FilterQuality.medium;
+
+    const double tileDur = 0.30;
+    const double maxStart = 1.0 - tileDur;
+
+    for (int r = 0; r < rows; r++) {
+      final double nv = (r + 0.5) / rows - 0.5;
+      for (int c = 0; c < cols; c++) {
+        final double nu = (c + 0.5) / cols - 0.5;
+        final double radial = math.sqrt(nu * nu + nv * nv) / 0.7071;
+        final double h0 = _hash01(c, r, 1);
+        final double h1 = _hash01(c, r, 2);
+        final double h2 = _hash01(c, r, 3);
+        final double h3 = _hash01(c, r, 4);
+
+        final double startT =
+            (radial * 0.42 + h0 * 0.58).clamp(0.0, 1.0) * maxStart;
+        final double localT = ((progress - startT) / tileDur).clamp(0.0, 1.0);
+        if (localT <= 0.001) continue;
+
+        final double eased = Curves.easeOutCubic.transform(localT);
+        final double alpha =
+            ((localT / 0.35).clamp(0.0, 1.0) * masterOpacity).clamp(0.0, 1.0);
+
+        // Slight overlap (+0.6px) prevents hairline seams between settled tiles.
+        final Rect src = Rect.fromLTWH(
+          c * srcTileW,
+          r * srcTileH,
+          srcTileW,
+          srcTileH,
+        );
+        final double targetLeft = ox + c * dstTileW;
+        final double targetTop = oy + r * dstTileH;
+        final double targetCx = targetLeft + dstTileW * 0.5;
+        final double targetCy = targetTop + dstTileH * 0.5;
+
+        tilePaint.color = Color.fromRGBO(255, 255, 255, alpha);
+
+        if (eased >= 0.999) {
+          final Rect dst = Rect.fromLTWH(
+            targetLeft - 0.5,
+            targetTop - 0.5,
+            dstTileW + 1.0,
+            dstTileH + 1.0,
+          );
+          canvas.drawImageRect(image, src, dst, tilePaint);
+        } else {
+          final double inv = 1.0 - eased;
+          final double dx =
+              (targetCx - screenCx) * (0.9 + h1 * 0.9) * inv +
+              (h2 - 0.5) * 140.0 * inv;
+          final double dy =
+              (targetCy - screenCy) * (0.9 + h2 * 0.9) * inv +
+              (h3 - 0.5) * 140.0 * inv;
+          final double scale = 0.25 + 0.75 * eased;
+          final double angle = (h1 - 0.5) * 0.55 * inv;
+
+          canvas.save();
+          canvas.translate(targetCx + dx, targetCy + dy);
+          canvas.rotate(angle);
+          canvas.scale(scale);
+          final Rect localDst = Rect.fromCenter(
+            center: Offset.zero,
+            width: dstTileW + 1.0,
+            height: dstTileH + 1.0,
+          );
+          canvas.drawImageRect(image, src, localDst, tilePaint);
+          canvas.restore();
+        }
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _PhotoFlyInPainter old) =>
+      old.image != image ||
+      old.progress != progress ||
+      old.masterOpacity != masterOpacity;
 }
 
 /// Thumbstick for walking on phones without AR tracking.

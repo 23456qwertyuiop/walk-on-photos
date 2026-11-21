@@ -3,9 +3,10 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
-import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:material_ui/material_ui.dart' show CircularProgressIndicator;
 import 'package:walk_on_photos/depth/depth_estimator.dart';
 import 'package:walk_on_photos/depth/depth_map.dart';
 import 'package:walk_on_photos/main.dart';
@@ -14,6 +15,7 @@ import 'package:walk_on_photos/render/scene_painter.dart';
 import 'package:walk_on_photos/scene/image_utils.dart';
 import 'package:walk_on_photos/scene/photo_scene.dart';
 import 'package:walk_on_photos/scene/scene_builder.dart';
+import 'package:walk_on_photos/ui/widgets.dart';
 
 /// Synthetic photo: left half red, right half blue, with a green square
 /// in the middle that is much closer than the "wall" behind it.
@@ -60,6 +62,34 @@ Future<List<int>> _pixel(ui.Image img, int x, int y) async {
 }
 
 void main() {
+  testWidgets('PhotoFlyInOverlay shows flying photo pieces without spinner or text', (
+    WidgetTester tester,
+  ) async {
+    ui.Image? photo;
+    await tester.runAsync(() async {
+      photo = await _testPhoto(120, 90);
+    });
+    await tester.pumpWidget(
+      Directionality(
+        textDirection: TextDirection.ltr,
+        child: PhotoFlyInOverlay(image: photo, busy: true, version: 1),
+      ),
+    );
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(find.byType(CircularProgressIndicator), findsNothing);
+    expect(find.byType(Text), findsNothing);
+    expect(find.byType(CustomPaint), findsOneWidget);
+
+    await tester.pumpWidget(
+      Directionality(
+        textDirection: TextDirection.ltr,
+        child: PhotoFlyInOverlay(image: photo, busy: false, version: 1),
+      ),
+    );
+    await tester.pumpAndSettle();
+    photo?.dispose();
+  });
+
   testWidgets('desktop UI asks for a photo on an empty background', (
     WidgetTester tester,
   ) async {
