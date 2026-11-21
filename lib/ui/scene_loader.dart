@@ -42,7 +42,7 @@ class SceneLoader extends ChangeNotifier {
       _setStage('AI 估算深度（Depth Anything V2）…');
       final DepthMap depth = await _estimator.estimate(photo);
 
-      _setStage('重建 3D 空间、补全遮挡背景…');
+      _setStage('重建 3D 空间、生成特征色彩粒子…');
       final PhotoScene built = await SceneBuilder.build(photo, depth);
 
       final PhotoScene? old = scene;

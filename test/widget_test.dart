@@ -120,8 +120,9 @@ void main() {
     expect(out[c + 1], 0);
   });
 
-  testWidgets('scene: foreground torn at depth edges, background inpainted, '
-      'start view reproduces the photo, walking adds parallax', (
+  testWidgets('scene: foreground torn at depth edges, occluded regions filled '
+      'with characteristic-colored particles, start view reproduces photo, '
+      'walking adds parallax', (
     WidgetTester tester,
   ) async {
     await tester.runAsync(() async {
@@ -135,16 +136,30 @@ void main() {
       // Torn: fewer foreground triangles than a full grid.
       const int gw = 64, gh = 48;
       expect(scene.foreground.triangleCount, lessThan((gw - 1) * (gh - 1) * 2));
-      expect(scene.background, isNotNull);
+      expect(scene.particles, isNotNull);
+      expect(scene.particles!.count, greaterThan(0));
 
       // The box is nearer than the wall.
       double zAt(SceneLayer l, int gx, int gy) =>
           l.positions[(gy * gw + gx) * 3 + 2];
       expect(zAt(scene.foreground, 32, 24), greaterThan(zAt(scene.foreground, 2, 2)));
 
-      // Background layer behind the box is the wall depth, and its texture
-      // under the box is not green any more.
-      expect(zAt(scene.background!, 32, 24), lessThan(zAt(scene.foreground, 32, 24)));
+      // Particles behind the box are deeper than the box itself, and carry
+      // surrounding wall colors (red/blue) rather than the box's green.
+      final ParticleCloud cloud = scene.particles!;
+      bool foundBehindBox = false;
+      for (int i = 0; i < cloud.count; i++) {
+        final double pz = cloud.positions[i * 3 + 2];
+        if (pz < zAt(scene.foreground, 32, 24)) {
+          foundBehindBox = true;
+          final int r = cloud.colors[i * 4];
+          final int g = cloud.colors[i * 4 + 1];
+          final int b = cloud.colors[i * 4 + 2];
+          expect(r > g || b > g, isTrue);
+          break;
+        }
+      }
+      expect(foundBehindBox, isTrue);
 
       // Start pose: screen == photo (box center green, left wall red).
       const Size size = Size(320, 240);
@@ -153,12 +168,15 @@ void main() {
       expect((await _pixel(frame, 160, 120))[1], greaterThan(150));
       expect((await _pixel(frame, 30, 120))[0], greaterThan(150));
 
-      // Step right: the near box shifts left much more than the far wall.
+      // Step right: the near box shifts left much more than the far wall,
+      // revealing background particles at center (160) while the box sits
+      // shifted left around x = 32..75.
       cam.x = 0.6;
       frame = await _render(scene, cam, size);
       final List<int> c = await _pixel(frame, 160, 120);
-      final List<int> at100 = await _pixel(frame, 100, 120);
-      expect(c[1] > 150 || at100[1] > 150, isTrue);
+      final List<int> shiftedBox = await _pixel(frame, 50, 120);
+      expect(shiftedBox[1], greaterThan(150));
+      expect(c[1], lessThan(100));
 
       // Walk into the scene past the box: no crash, near-plane clipping.
       cam
@@ -209,7 +227,7 @@ void main() {
         }
         // ignore: avoid_print
         print('fg tris ${scene.foreground.triangleCount}, '
-            'bg tris ${scene.background?.triangleCount}, '
+            'particles ${scene.particles?.count}, '
             'depth ${dw}x$dh, focal ${scene.focalPx.toStringAsFixed(0)}, '
             'max z ${scene.foreground.positions.reduce(math.min).toStringAsFixed(2)}');
         scene.dispose();

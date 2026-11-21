@@ -36,24 +36,46 @@ class SceneLayer {
   void dispose() => texture.dispose();
 }
 
+/// Colored 3D particles used to fill occluded / torn regions behind
+/// foreground edges instead of blurry inpainted polygons.
+class ParticleCloud {
+  ParticleCloud({
+    required this.positions,
+    required this.colors,
+    required this.sizes,
+  }) : assert(positions.length == sizes.length * 3),
+       assert(colors.length == sizes.length * 4);
+
+  /// xyz per particle, in meters (same coordinate space as [SceneLayer]).
+  final Float32List positions;
+
+  /// RGBA uint8 per particle, 4 bytes per particle.
+  final Uint8List colors;
+
+  /// World-space radius in meters per particle.
+  final Float32List sizes;
+
+  int get count => sizes.length;
+}
+
 /// A photo reconstructed as a walkable 3D space.
 ///
 /// [foreground] is the photo itself, unprojected with the estimated depth and
 /// torn apart at depth discontinuities (so a person does not get "rubber
-/// sheeted" onto the wall behind them). [background] fills the gaps that open
-/// up behind torn edges once you move, using depth and colors propagated from
-/// the surrounding background (a simple form of layered-depth inpainting).
+/// sheeted" onto the wall behind them). [particles] fills the occluded and
+/// blurry torn-edge regions that open up once you move, using small 3D
+/// particles carrying characteristic colors sampled from the surrounding scene.
 class PhotoScene {
   PhotoScene({
     required this.foreground,
-    required this.background,
+    required this.particles,
     required this.imageWidth,
     required this.imageHeight,
     required this.focalPx,
   });
 
   final SceneLayer foreground;
-  final SceneLayer? background;
+  final ParticleCloud? particles;
 
   /// Size of the source photo in pixels.
   final int imageWidth;
@@ -62,13 +84,9 @@ class PhotoScene {
   /// Focal length (in source-photo pixels) used to unproject the photo.
   final double focalPx;
 
-  List<SceneLayer> get layers => <SceneLayer>[
-    ?background,
-    foreground,
-  ];
+  List<SceneLayer> get layers => <SceneLayer>[foreground];
 
   void dispose() {
     foreground.dispose();
-    background?.dispose();
   }
 }

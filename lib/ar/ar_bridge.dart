@@ -84,6 +84,7 @@ class ArViewController {
   /// tracking is good.
   Future<void> loadScene(PhotoScene scene) async {
     placed.value = false;
+    final ParticleCloud? particles = scene.particles;
     await _channel.invokeMethod<void>('loadScene', <String, Object>{
       'layers': <Map<String, Object>>[
         for (final SceneLayer l in scene.layers)
@@ -92,9 +93,14 @@ class ArViewController {
             'uvs': l.uvs,
             'indices': l.indices,
             'texture': l.texturePng,
-            'isBackground': identical(l, scene.background),
           },
       ],
+      if (particles != null && particles.count > 0)
+        'particles': <String, Object>{
+          'positions': particles.positions,
+          'colors': particles.colors,
+          'sizes': particles.sizes,
+        },
     });
   }
 

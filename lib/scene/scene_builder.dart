@@ -14,10 +14,11 @@ class SceneBuildOptions {
     this.nearMeters = 1.2,
     this.farMeters = 9.0,
     this.focalFactor = 0.8,
-    this.tearRatio = 1.10,
+    this.tearRatio = 1.07,
     this.occluderRatio = 1.12,
     this.textureLongSide = 2048,
     this.backgroundTextureLongSide = 512,
+    this.maxParticles = 16000,
   });
 
   /// Number of grid vertices along the long side of the photo.
@@ -36,7 +37,8 @@ class SceneBuildOptions {
   /// A triangle is torn when its farthest vertex is this many times farther
   /// than its nearest one. Using a depth *ratio* (not a disparity difference)
   /// keeps steep but smooth near surfaces (a face, a cat's back) intact while
-  /// still separating objects from what is behind them.
+  /// separating objects and breaking blurry grazing-angle stretches into
+  /// characteristic-colored particles.
   final double tearRatio;
 
   /// A point counts as an occluder when its local background is at least
@@ -45,6 +47,9 @@ class SceneBuildOptions {
 
   final int textureLongSide;
   final int backgroundTextureLongSide;
+
+  /// Soft cap on generated particles in occluded / torn regions.
+  final int maxParticles;
 }
 
 /// Builds a [PhotoScene] from a decoded photo and its depth map.
@@ -86,21 +91,18 @@ class SceneBuilder {
       texturePng: fgPng,
     );
 
-    SceneLayer? bg;
-    if (r.bgIndices.isNotEmpty) {
-      final ui.Image bgImage = await rgbaToImage(r.bgRgba, bgSize.w, bgSize.h);
-      bg = SceneLayer(
-        positions: r.bgPositions,
-        uvs: r.uvs,
-        indices: r.bgIndices,
-        texture: bgImage,
-        texturePng: await encodePng(bgImage),
+    ParticleCloud? particles;
+    if (r.particleSizes.isNotEmpty) {
+      particles = ParticleCloud(
+        positions: r.particlePositions,
+        colors: r.particleColors,
+        sizes: r.particleSizes,
       );
     }
 
     return PhotoScene(
       foreground: fg,
-      background: bg,
+      particles: particles,
       imageWidth: photo.width,
       imageHeight: photo.height,
       focalPx: options.focalFactor * math.max(photo.width, photo.height),
@@ -135,19 +137,19 @@ class _MeshInput {
 class _MeshResult {
   _MeshResult({
     required this.fgPositions,
-    required this.bgPositions,
     required this.uvs,
     required this.fgIndices,
-    required this.bgIndices,
-    required this.bgRgba,
+    required this.particlePositions,
+    required this.particleColors,
+    required this.particleSizes,
   });
 
   final Float32List fgPositions;
-  final Float32List bgPositions;
   final Float32List uvs;
   final Int32List fgIndices;
-  final Int32List bgIndices;
-  final Uint8List bgRgba;
+  final Float32List particlePositions;
+  final Uint8List particleColors;
+  final Float32List particleSizes;
 }
 
 /// Exposed for tests.
@@ -200,11 +202,13 @@ _MeshResult _buildMeshes(_MeshInput input) {
     }
   }
 
-  // Local background disparity: the farthest surface within a radius,
-  // smoothed. Pixels clearly nearer than it are occluders.
-  final int radius = math.max(2, (gw * 0.05).round());
+  // Local background disparity: the farthest surface within a wide radius
+  // (using O(N) sliding-window min filter), smoothed. Pixels clearly nearer
+  // than it are occluders.
+  final int radius = math.max(3, (gw * 0.16).round());
   Float32List bgG = minFilter(g, gw, gh, radius);
-  bgG = boxBlur(boxBlur(bgG, gw, gh, radius ~/ 2), gw, gh, radius ~/ 2);
+  final int blurR = math.max(1, (gw * 0.025).round());
+  bgG = boxBlur(boxBlur(bgG, gw, gh, blurR), gw, gh, blurR);
   for (int i = 0; i < n; i++) {
     if (bgG[i] > g[i]) bgG[i] = g[i];
   }
@@ -230,7 +234,6 @@ _MeshResult _buildMeshes(_MeshInput input) {
   final double f = o.focalFactor * math.max(imgW, imgH);
 
   final Float32List fgPos = Float32List(n * 3);
-  final Float32List bgPos = Float32List(n * 3);
   final Float32List uvs = Float32List(n * 2);
   for (int y = 0; y < gh; y++) {
     final double v = y / (gh - 1);
@@ -240,30 +243,30 @@ _MeshResult _buildMeshes(_MeshInput input) {
       final double px = (u - 0.5) * imgW / f;
       final int i = y * gw + x;
       final double zf = zg[i];
-      // Push the background layer back a hair so it never z-fights the
-      // foreground where both overlap.
-      final double zb = zbg[i] * 1.01;
       fgPos[i * 3] = px * zf;
       fgPos[i * 3 + 1] = -py * zf;
       fgPos[i * 3 + 2] = -zf;
-      bgPos[i * 3] = px * zb;
-      bgPos[i * 3 + 1] = -py * zb;
-      bgPos[i * 3 + 2] = -zb;
       uvs[i * 2] = u;
       uvs[i * 2 + 1] = v;
     }
   }
 
-  // Triangulate; tear the foreground where depth jumps.
+  // Triangulate; tear the foreground where depth jumps or stretches steeply.
   final List<int> fgIdx = <int>[];
-  final List<int> bgIdx = <int>[];
+  final Uint8List tornCell = Uint8List(n);
   void addTri(int a, int b, int c) {
     final double za = zg[a], zb = zg[b], zc = zg[c];
     final double zMax = math.max(za, math.max(zb, zc));
     final double zMin = math.min(za, math.min(zb, zc));
-    if (zMax <= zMin * o.tearRatio) fgIdx..add(a)..add(b)..add(c);
-    if (bgMask[a] == 1 || bgMask[b] == 1 || bgMask[c] == 1) {
-      bgIdx..add(a)..add(b)..add(c);
+    if (zMax <= zMin * o.tearRatio) {
+      fgIdx
+        ..add(a)
+        ..add(b)
+        ..add(c);
+    } else {
+      tornCell[a] = 1;
+      tornCell[b] = 1;
+      tornCell[c] = 1;
     }
   }
 
@@ -278,11 +281,8 @@ _MeshResult _buildMeshes(_MeshInput input) {
     }
   }
 
-  // Background texture: erase occluder colors and fill them from the
-  // surrounding background so people/objects are not "ghosted" behind
-  // themselves. The outermost occluder cell keeps its original colors: the
-  // torn cells on a silhouette show the background layer, and keeping the
-  // real pixels there makes the start view seamless (no stair-step edges).
+  // Erode occluder mask to erase foreground colors from the inner hole,
+  // then compute push-pull fallback colors.
   final Uint8List holeGrid = erode(occ, gw, gh, 1);
   final Uint8List hole = Uint8List(input.bw * input.bh);
   for (int y = 0; y < input.bh; y++) {
@@ -299,39 +299,352 @@ _MeshResult _buildMeshes(_MeshInput input) {
     input.bh,
   );
 
+  // Replace the blurry occluded / torn regions with characteristic-colored
+  // 3D particles sampled from surrounding valid background pixels.
+  final ({Float32List pos, Uint8List col, Float32List size}) particles =
+      _buildParticles(
+        gw: gw,
+        gh: gh,
+        imgW: imgW,
+        imgH: imgH,
+        f: f,
+        zbg: zbg,
+        occ: occ,
+        bgMask: bgMask,
+        tornCell: tornCell,
+        holeGrid: holeGrid,
+        origRgba: input.bgRgba,
+        filledRgba: filled,
+        bw: input.bw,
+        bh: input.bh,
+        maxParticles: o.maxParticles,
+      );
+
   return _MeshResult(
     fgPositions: fgPos,
-    bgPositions: bgPos,
     uvs: uvs,
     fgIndices: Int32List.fromList(fgIdx),
-    bgIndices: Int32List.fromList(bgIdx),
-    bgRgba: filled,
+    particlePositions: particles.pos,
+    particleColors: particles.col,
+    particleSizes: particles.size,
   );
 }
 
-/// Separable min filter (keeps the farthest = smallest disparity).
-@visibleForTesting
-Float32List minFilter(Float32List src, int w, int h, int r) {
-  final Float32List tmp = Float32List(src.length);
-  final Float32List out = Float32List(src.length);
-  for (int y = 0; y < h; y++) {
-    for (int x = 0; x < w; x++) {
-      double m = double.infinity;
-      for (int k = math.max(0, x - r); k <= math.min(w - 1, x + r); k++) {
-        final double v = src[y * w + k];
-        if (v < m) m = v;
-      }
-      tmp[y * w + x] = m;
+({Float32List pos, Uint8List col, Float32List size}) _buildParticles({
+  required int gw,
+  required int gh,
+  required double imgW,
+  required double imgH,
+  required double f,
+  required Float32List zbg,
+  required Uint8List occ,
+  required Uint8List bgMask,
+  required Uint8List tornCell,
+  required Uint8List holeGrid,
+  required Uint8List origRgba,
+  required Uint8List filledRgba,
+  required int bw,
+  required int bh,
+  required int maxParticles,
+}) {
+  final int n = gw * gh;
+  final Uint8List particleMask = Uint8List(n);
+  int maskedCells = 0;
+  for (int i = 0; i < n; i++) {
+    if (bgMask[i] == 1 || tornCell[i] == 1) {
+      particleMask[i] = 1;
+      maskedCells++;
     }
   }
-  for (int y = 0; y < h; y++) {
-    for (int x = 0; x < w; x++) {
-      double m = double.infinity;
-      for (int k = math.max(0, y - r); k <= math.min(h - 1, y + r); k++) {
-        final double v = tmp[k * w + x];
-        if (v < m) m = v;
+  if (maskedCells == 0) {
+    return (
+      pos: Float32List(0),
+      col: Uint8List(0),
+      size: Float32List(0),
+    );
+  }
+
+  // Cells strictly belonging to genuine background (not inside occluders or
+  // torn foreground edges) provide crisp characteristic color samples.
+  final Uint8List validBg = Uint8List(n);
+  int validCount = 0;
+  for (int i = 0; i < n; i++) {
+    if (occ[i] == 0 && tornCell[i] == 0) {
+      validBg[i] = 1;
+      validCount++;
+    }
+  }
+  if (validCount == 0) {
+    for (int i = 0; i < n; i++) {
+      if (holeGrid[i] == 0) {
+        validBg[i] = 1;
+        validCount++;
       }
-      out[y * w + x] = m;
+    }
+  }
+
+  // Precompute 8-directional nearest valid background cells in O(N).
+  const List<int> dirDx = <int>[-1, 1, 0, 0, -1, 1, -1, 1];
+  const List<int> dirDy = <int>[0, 0, -1, 1, -1, -1, 1, 1];
+  final List<Int32List> hitIdx = List<Int32List>.generate(
+    8,
+    (_) => Int32List(n)..fillRange(0, n, -1),
+  );
+  final List<Int32List> hitDist = List<Int32List>.generate(
+    8,
+    (_) => Int32List(n)..fillRange(0, n, 1 << 20),
+  );
+
+  for (int d = 0; d < 8; d++) {
+    final int dx = dirDx[d];
+    final int dy = dirDy[d];
+    final Int32List hi = hitIdx[d];
+    final Int32List hd = hitDist[d];
+    // Sweep in the direction opposite to (dx, dy) so neighbor (x + dx, y + dy)
+    // is already computed.
+    final int xStart = dx > 0 ? gw - 1 : 0;
+    final int xEnd = dx > 0 ? -1 : gw;
+    final int xStep = dx > 0 ? -1 : 1;
+    final int yStart = dy > 0 ? gh - 1 : 0;
+    final int yEnd = dy > 0 ? -1 : gh;
+    final int yStep = dy > 0 ? -1 : 1;
+
+    for (int y = yStart; y != yEnd; y += yStep) {
+      for (int x = xStart; x != xEnd; x += xStep) {
+        final int i = y * gw + x;
+        if (validBg[i] == 1) {
+          hi[i] = i;
+          hd[i] = 0;
+          continue;
+        }
+        final int nx = x + dx;
+        final int ny = y + dy;
+        if (nx >= 0 && nx < gw && ny >= 0 && ny < gh) {
+          final int ni = ny * gw + nx;
+          if (hi[ni] >= 0) {
+            hi[i] = hi[ni];
+            hd[i] = hd[ni] + 1;
+          }
+        }
+      }
+    }
+  }
+
+  // Decide sampling density: pack enough particles to fill occluded holes
+  // densely while preserving visible individual particle texture.
+  final int samplesPerCell;
+  final int cellStep;
+  if (maskedCells * 3 <= maxParticles) {
+    samplesPerCell = 3;
+    cellStep = 1;
+  } else if (maskedCells * 2 <= maxParticles) {
+    samplesPerCell = 2;
+    cellStep = 1;
+  } else if (maskedCells <= maxParticles) {
+    samplesPerCell = 1;
+    cellStep = 1;
+  } else {
+    samplesPerCell = 1;
+    cellStep = math.max(2, math.sqrt(maskedCells / maxParticles).ceil());
+  }
+
+  final int capacity = maskedCells * samplesPerCell;
+  final Float32List outPos = Float32List(capacity * 3);
+  final Uint8List outCol = Uint8List(capacity * 4);
+  final Float32List outSize = Float32List(capacity);
+
+  double hash01(int a, int b, int c) {
+    int h = a * 374761393 + b * 668265263 + c * 2147483647;
+    h = (h ^ (h >> 13)) * 1274126177;
+    h ^= (h >> 16);
+    return (h & 0x00FFFFFF) / 16777216.0;
+  }
+
+  double sampleZbg(double gx, double gy) {
+    final double cx = gx.clamp(0.0, (gw - 1).toDouble());
+    final double cy = gy.clamp(0.0, (gh - 1).toDouble());
+    final int x0 = cx.floor();
+    final int y0 = cy.floor();
+    final int x1 = math.min(gw - 1, x0 + 1);
+    final int y1 = math.min(gh - 1, y0 + 1);
+    final double fx = cx - x0;
+    final double fy = cy - y0;
+    final double a = zbg[y0 * gw + x0];
+    final double b = zbg[y0 * gw + x1];
+    final double c = zbg[y1 * gw + x0];
+    final double d = zbg[y1 * gw + x1];
+    return (a * (1 - fx) + b * fx) * (1 - fy) + (c * (1 - fx) + d * fx) * fy;
+  }
+
+  final List<int> candRgb = List<int>.filled(24, 0);
+  final List<double> candWeight = List<double>.filled(8, 0.0);
+
+  int count = 0;
+  for (int gy = 0; gy < gh; gy += cellStep) {
+    for (int gx = 0; gx < gw; gx += cellStep) {
+      final int cellIdx = gy * gw + gx;
+      if (particleMask[cellIdx] == 0) continue;
+
+      // Gather directional characteristic background colors around this cell.
+      int candCount = 0;
+      double weightSum = 0.0;
+      for (int d = 0; d < 8; d++) {
+        final int hit = hitIdx[d][cellIdx];
+        if (hit < 0) continue;
+        int hx = hit % gw;
+        int hy = hit ~/ gw;
+        // Step 2 cells deeper into valid background to avoid edge fringe.
+        for (int step = 0; step < 3; step++) {
+          final int sx = hx + dirDx[d];
+          final int sy = hy + dirDy[d];
+          if (sx >= 0 && sx < gw && sy >= 0 && sy < gh && validBg[sy * gw + sx] == 1) {
+            hx = sx;
+            hy = sy;
+          } else {
+            break;
+          }
+        }
+        final int bx = (hx / (gw - 1) * (bw - 1)).round().clamp(0, bw - 1);
+        final int by = (hy / (gh - 1) * (bh - 1)).round().clamp(0, bh - 1);
+        final int p = (by * bw + bx) * 4;
+        final double w = 1.0 / (hitDist[d][cellIdx] + 2.0);
+        candRgb[candCount * 3] = origRgba[p];
+        candRgb[candCount * 3 + 1] = origRgba[p + 1];
+        candRgb[candCount * 3 + 2] = origRgba[p + 2];
+        candWeight[candCount] = w;
+        weightSum += w;
+        candCount++;
+      }
+
+      final int fbx = (gx / (gw - 1) * (bw - 1)).round().clamp(0, bw - 1);
+      final int fby = (gy / (gh - 1) * (bh - 1)).round().clamp(0, bh - 1);
+      final int fp = (fby * bw + fbx) * 4;
+      final int baseR = filledRgba[fp];
+      final int baseG = filledRgba[fp + 1];
+      final int baseB = filledRgba[fp + 2];
+
+      final bool insideCore = occ[cellIdx] == 1;
+      final bool isBg = bgMask[cellIdx] == 1;
+
+      for (int s = 0; s < samplesPerCell; s++) {
+        if (count >= capacity) break;
+        final double jx = (hash01(gx, gy, s * 7 + 1) - 0.5) * 1.15 * cellStep;
+        final double jy = (hash01(gx, gy, s * 7 + 2) - 0.5) * 1.15 * cellStep;
+        final double jz = hash01(gx, gy, s * 7 + 3) * 0.045;
+        final double js = hash01(gx, gy, s * 7 + 4);
+        final double jc = hash01(gx, gy, s * 7 + 5);
+        final double jb = hash01(gx, gy, s * 7 + 6);
+
+        final double sgx = (gx + jx).clamp(0.0, (gw - 1).toDouble());
+        final double sgy = (gy + jy).clamp(0.0, (gh - 1).toDouble());
+        final double u = sgx / (gw - 1);
+        final double v = sgy / (gh - 1);
+        final double px = (u - 0.5) * imgW / f;
+        final double py = (v - 0.5) * imgH / f;
+        final double z = sampleZbg(sgx, sgy) * (1.01 + jz);
+
+        outPos[count * 3] = px * z;
+        outPos[count * 3 + 1] = -py * z;
+        outPos[count * 3 + 2] = -z;
+
+        // World-space radius scaled with grid cell size at depth z.
+        final double cellWorld = (imgW / f) * z / gw * cellStep;
+        outSize[count] = cellWorld * (0.50 + js * 0.62);
+
+        // Pick a characteristic color from surrounding background rays.
+        int r = baseR;
+        int g = baseG;
+        int b = baseB;
+        if (candCount > 0 && weightSum > 0) {
+          double target = jc * weightSum;
+          int picked = candCount - 1;
+          for (int k = 0; k < candCount; k++) {
+            target -= candWeight[k];
+            if (target <= 0) {
+              picked = k;
+              break;
+            }
+          }
+          final int sr = candRgb[picked * 3];
+          final int sg = candRgb[picked * 3 + 1];
+          final int sb = candRgb[picked * 3 + 2];
+          // Use real surrounding characteristic sample with tiny base anchor.
+          const double realMix = 0.88;
+          r = (sr * realMix + baseR * (1.0 - realMix)).round();
+          g = (sg * realMix + baseG * (1.0 - realMix)).round();
+          b = (sb * realMix + baseB * (1.0 - realMix)).round();
+        }
+
+        // Subtle saturation & brightness variation so particles read as
+        // distinct shimmering colored points rather than uniform mud.
+        final double lum = 0.299 * r + 0.587 * g + 0.114 * b;
+        const double satBoost = 1.15;
+        final double bright = 0.86 + jb * 0.28;
+        final int fr = ((lum + (r - lum) * satBoost) * bright).round().clamp(0, 255);
+        final int fg = ((lum + (g - lum) * satBoost) * bright).round().clamp(0, 255);
+        final int fb = ((lum + (b - lum) * satBoost) * bright).round().clamp(0, 255);
+        final int fa = insideCore
+            ? (225 + (js * 30).round()).clamp(0, 255)
+            : (isBg ? (220 + (js * 35).round()) : (210 + (js * 45).round()));
+
+        outCol[count * 4] = fr;
+        outCol[count * 4 + 1] = fg;
+        outCol[count * 4 + 2] = fb;
+        outCol[count * 4 + 3] = fa;
+        count++;
+      }
+    }
+  }
+
+  return (
+    pos: Float32List.sublistView(outPos, 0, count * 3),
+    col: Uint8List.sublistView(outCol, 0, count * 4),
+    size: Float32List.sublistView(outSize, 0, count),
+  );
+}
+
+/// Separable O(N) sliding-window min filter (keeps the farthest = smallest disparity).
+@visibleForTesting
+Float32List minFilter(Float32List src, int w, int h, int r) {
+  if (r <= 0) return Float32List.fromList(src);
+  final Float32List tmp = Float32List(src.length);
+  final Float32List out = Float32List(src.length);
+  final Int32List dq = Int32List(math.max(w, h) + 2);
+
+  for (int y = 0; y < h; y++) {
+    final int row = y * w;
+    int head = 0, tail = 0;
+    for (int x = 0; x < w + r; x++) {
+      if (x < w) {
+        final double v = src[row + x];
+        while (tail > head && src[row + dq[tail - 1]] >= v) {
+          tail--;
+        }
+        dq[tail++] = x;
+      }
+      final int c = x - r;
+      if (c >= 0) {
+        if (dq[head] < c - r) head++;
+        tmp[row + c] = src[row + dq[head]];
+      }
+    }
+  }
+
+  for (int x = 0; x < w; x++) {
+    int head = 0, tail = 0;
+    for (int y = 0; y < h + r; y++) {
+      if (y < h) {
+        final double v = tmp[y * w + x];
+        while (tail > head && tmp[dq[tail - 1] * w + x] >= v) {
+          tail--;
+        }
+        dq[tail++] = y;
+      }
+      final int c = y - r;
+      if (c >= 0) {
+        if (dq[head] < c - r) head++;
+        out[c * w + x] = tmp[dq[head] * w + x];
+      }
     }
   }
   return out;

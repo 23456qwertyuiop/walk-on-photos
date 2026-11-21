@@ -54,9 +54,11 @@ class ArPhotoView(
     private var session: Session? = null
     private val background = BackgroundRenderer()
     private val meshes = mutableListOf<MeshRenderer>()
+    private var particleRenderer: ParticleRenderer? = null
     private var anchor: Anchor? = null
 
     @Volatile private var pendingLayers: List<LayerData>? = null
+    @Volatile private var pendingParticles: ParticleData? = null
     @Volatile private var placeRequested = false
     @Volatile private var displayChanged = false
     private var viewportWidth = 1
@@ -116,6 +118,15 @@ class ArPhotoView(
                     result.error("bad_args", "layers missing", null)
                     return
                 }
+                @Suppress("UNCHECKED_CAST")
+                val particles = call.argument<Map<String, Any>>("particles")
+                pendingParticles = particles?.let {
+                    ParticleData(
+                        positions = it["positions"] as FloatArray,
+                        colors = it["colors"] as ByteArray,
+                        sizes = it["sizes"] as FloatArray,
+                    )
+                }
                 pendingLayers = layers.map {
                     LayerData(
                         positions = it["positions"] as FloatArray,
@@ -150,6 +161,7 @@ class ArPhotoView(
         background.create()
         // Textures/buffers were lost with the old context: re-upload.
         meshes.forEach { it.contextLost() }
+        particleRenderer?.contextLost()
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
@@ -182,6 +194,11 @@ class ArPhotoView(
             meshes.forEach { it.release() }
             meshes.clear()
             layers.forEach { meshes.add(MeshRenderer(it)) }
+            particleRenderer?.release()
+            particleRenderer = pendingParticles?.let {
+                pendingParticles = null
+                ParticleRenderer(it)
+            }
             placeRequested = true
         }
 
@@ -200,6 +217,7 @@ class ArPhotoView(
         Matrix.multiplyMM(modelView, 0, view, 0, model, 0)
         Matrix.multiplyMM(mvp, 0, proj, 0, modelView, 0)
         meshes.forEach { it.draw(mvp) }
+        particleRenderer?.draw(mvp, viewportHeight.toFloat() * 0.8f)
     }
 
     /** Photo camera = phone position, facing the phone's heading, level. */
@@ -249,6 +267,16 @@ class LayerData(
     val indices: IntArray,
     val png: ByteArray,
 )
+
+class ParticleData(
+    val positions: FloatArray,
+    val colors: ByteArray,
+    val sizes: FloatArray,
+)
+
+private fun byteBuffer(data: ByteArray): ByteBuffer =
+    ByteBuffer.allocateDirect(data.size).order(ByteOrder.nativeOrder())
+        .apply { put(data); position(0) }
 
 // ------------------------------------------------------------------ GL utils
 
@@ -448,6 +476,121 @@ private class MeshRenderer(private val data: LayerData) {
         if (!uploaded) return
         GLES30.glDeleteBuffers(3, buffers, 0)
         GLES30.glDeleteTextures(1, texture, 0)
+        GLES30.glDeleteProgram(program)
+        uploaded = false
+    }
+}
+
+/** Soft circular particles filling occluded/torn regions in AR. */
+private class ParticleRenderer(private val data: ParticleData) {
+    private var program = 0
+    private var aPos = 0
+    private var aCol = 0
+    private var aSize = 0
+    private var uMvp = 0
+    private var uPointScale = 0
+    private val buffers = IntArray(3)
+    private var uploaded = false
+    private val count = data.sizes.size
+
+    fun contextLost() {
+        uploaded = false
+    }
+
+    private fun upload() {
+        program = link(
+            """
+            #version 300 es
+            in vec3 a_Position;
+            in vec4 a_Color;
+            in float a_Size;
+            uniform mat4 u_Mvp;
+            uniform float u_PointScale;
+            out vec4 v_Color;
+            void main() {
+                gl_Position = u_Mvp * vec4(a_Position, 1.0);
+                gl_PointSize = clamp(u_PointScale * a_Size / max(gl_Position.w, 0.05), 2.0, 56.0);
+                v_Color = a_Color;
+            }
+            """.trimIndent(),
+            """
+            #version 300 es
+            precision mediump float;
+            in vec4 v_Color;
+            out vec4 fragColor;
+            void main() {
+                vec2 c = gl_PointCoord - vec2(0.5);
+                float d = length(c);
+                if (d > 0.5) discard;
+                float falloff = smoothstep(0.5, 0.08, d);
+                fragColor = vec4(v_Color.rgb, v_Color.a * falloff);
+            }
+            """.trimIndent(),
+        )
+        aPos = GLES30.glGetAttribLocation(program, "a_Position")
+        aCol = GLES30.glGetAttribLocation(program, "a_Color")
+        aSize = GLES30.glGetAttribLocation(program, "a_Size")
+        uMvp = GLES30.glGetUniformLocation(program, "u_Mvp")
+        uPointScale = GLES30.glGetUniformLocation(program, "u_PointScale")
+
+        GLES30.glGenBuffers(3, buffers, 0)
+        GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, buffers[0])
+        GLES30.glBufferData(
+            GLES30.GL_ARRAY_BUFFER, data.positions.size * 4,
+            floatBuffer(data.positions), GLES30.GL_STATIC_DRAW,
+        )
+        GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, buffers[1])
+        GLES30.glBufferData(
+            GLES30.GL_ARRAY_BUFFER, data.colors.size,
+            byteBuffer(data.colors), GLES30.GL_STATIC_DRAW,
+        )
+        GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, buffers[2])
+        GLES30.glBufferData(
+            GLES30.GL_ARRAY_BUFFER, data.sizes.size * 4,
+            floatBuffer(data.sizes), GLES30.GL_STATIC_DRAW,
+        )
+        GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, 0)
+        uploaded = true
+    }
+
+    fun draw(mvp: FloatArray, pointScale: Float) {
+        if (count == 0) return
+        if (!uploaded) upload()
+        GLES30.glEnable(GLES30.GL_DEPTH_TEST)
+        GLES30.glDepthMask(false)
+        GLES30.glEnable(GLES30.GL_BLEND)
+        GLES30.glBlendFunc(GLES30.GL_SRC_ALPHA, GLES30.GL_ONE_MINUS_SRC_ALPHA)
+
+        GLES30.glUseProgram(program)
+        GLES30.glUniformMatrix4fv(uMvp, 1, false, mvp, 0)
+        GLES30.glUniform1f(uPointScale, pointScale)
+
+        GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, buffers[0])
+        GLES30.glVertexAttribPointer(aPos, 3, GLES30.GL_FLOAT, false, 0, 0)
+        GLES30.glEnableVertexAttribArray(aPos)
+
+        GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, buffers[1])
+        GLES30.glVertexAttribPointer(aCol, 4, GLES30.GL_UNSIGNED_BYTE, true, 0, 0)
+        GLES30.glEnableVertexAttribArray(aCol)
+
+        GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, buffers[2])
+        GLES30.glVertexAttribPointer(aSize, 1, GLES30.GL_FLOAT, false, 0, 0)
+        GLES30.glEnableVertexAttribArray(aSize)
+
+        GLES30.glDrawArrays(GLES30.GL_POINTS, 0, count)
+
+        GLES30.glDisableVertexAttribArray(aPos)
+        GLES30.glDisableVertexAttribArray(aCol)
+        GLES30.glDisableVertexAttribArray(aSize)
+        GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, 0)
+
+        GLES30.glDisable(GLES30.GL_BLEND)
+        GLES30.glDepthMask(true)
+    }
+
+    fun release() {
+        if (!uploaded) return
+        GLES30.glDeleteBuffers(3, buffers, 0)
         GLES30.glDeleteProgram(program)
         uploaded = false
     }
