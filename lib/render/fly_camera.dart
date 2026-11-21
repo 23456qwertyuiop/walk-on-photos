@@ -27,6 +27,17 @@ class FlyCamera extends ChangeNotifier {
 
   static const double maxPitch = 1.35;
 
+  /// Smoothed velocity (m/s): walking eases in and out instead of starting
+  /// and stopping instantly like a camera on rails.
+  double _vx = 0, _vy = 0, _vz = 0;
+
+  /// Vertical head bob while walking (meters), added to [eyeY].
+  double bob = 0;
+  double _bobPhase = 0;
+
+  /// Height of the eye used for rendering (position + head bob).
+  double get eyeY => y + bob;
+
   final Set<LogicalKeyboardKey> _keys = <LogicalKeyboardKey>{};
   double _joyX = 0, _joyY = 0;
 
@@ -73,6 +84,9 @@ class FlyCamera extends ChangeNotifier {
     z = 0;
     yaw = 0;
     pitch = useSensors && gyroEnabled ? (_gravityPitch ?? 0) : 0;
+    _vx = _vy = _vz = 0;
+    bob = 0;
+    _bobPhase = 0;
     notifyListeners();
   }
 
@@ -114,7 +128,16 @@ class FlyCamera extends ChangeNotifier {
         _down(LogicalKeyboardKey.shiftRight)) {
       up -= 1;
     }
-    if (fwd == 0 && side == 0 && up == 0) return;
+    final bool input = fwd != 0 || side != 0 || up != 0;
+    final double moving = _vx.abs() + _vy.abs() + _vz.abs();
+    if (!input && moving < 1e-3 && bob.abs() < 1e-4) {
+      if (moving != 0 || bob != 0) {
+        _vx = _vy = _vz = 0;
+        bob = 0;
+        notifyListeners();
+      }
+      return;
+    }
 
     final double len = math.sqrt(fwd * fwd + side * side);
     if (len > 1) {
@@ -122,12 +145,25 @@ class FlyCamera extends ChangeNotifier {
       side /= len;
     }
     final double speed =
-        walkSpeed * (_down(LogicalKeyboardKey.keyR) ? 2.5 : 1.0) * dt;
+        walkSpeed * (_down(LogicalKeyboardKey.keyR) ? 2.5 : 1.0);
     final double s = math.sin(yaw), c = math.cos(yaw);
     // forward = (-sin, 0, -cos), right = (cos, 0, -sin)
-    x += (-s * fwd + c * side) * speed;
-    z += (-c * fwd - s * side) * speed;
-    y += up * speed * 0.7;
+    final double tx = (-s * fwd + c * side) * speed;
+    final double tz = (-c * fwd - s * side) * speed;
+    final double ty = up * speed * 0.7;
+    // Ease toward the target velocity (~0.25 s to full speed / to a stop).
+    final double k = 1 - math.exp(-dt * (input ? 9.0 : 7.0));
+    _vx += (tx - _vx) * k;
+    _vy += (ty - _vy) * k;
+    _vz += (tz - _vz) * k;
+    x += _vx * dt;
+    y += _vy * dt;
+    z += _vz * dt;
+
+    // Gentle head bob: ~2 steps per second at walking pace, a couple of cm.
+    final double hs = math.sqrt(_vx * _vx + _vz * _vz);
+    _bobPhase += dt * hs * 8.0;
+    bob = math.sin(_bobPhase) * 0.016 * math.min(1.0, hs / walkSpeed);
     _clamp();
     notifyListeners();
   }

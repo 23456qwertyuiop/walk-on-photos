@@ -13,22 +13,34 @@ class SceneBuildOptions {
     this.gridLongSide = 224,
     this.nearMeters = 1.2,
     this.farMeters = 9.0,
+    this.skyMeters = 80.0,
+    this.skyRatio = 0.02,
     this.focalFactor = 0.8,
     this.tearRatio = 1.08,
     this.occluderRatio = 1.12,
+    this.guideRadius = 3,
+    this.guideEps = 0.0025,
+    this.ringFraction = 0.18,
     this.textureLongSide = 2048,
-    this.backgroundTextureLongSide = 512,
-    this.maxParticles = 24000,
+    this.backgroundTextureLongSide = 1024,
   });
 
   /// Number of grid vertices along the long side of the photo.
   final int gridLongSide;
 
-  /// Distance of the nearest / farthest point of the photo, in meters.
-  /// Depth models only give relative depth; these fix the scale so that
-  /// walking ~1–3 m gets you "into" the picture.
+  /// Distance of the nearest / farthest (non-sky) point of the photo, in
+  /// meters. Depth models only give relative depth; these fix the scale so
+  /// that walking ~1–3 m gets you "into" the picture.
   final double nearMeters;
   final double farMeters;
+
+  /// Sky (raw disparity ≈ 0) is pushed out to this distance so it behaves
+  /// like a real sky: no parallax, it never "comes closer" as you walk.
+  final double skyMeters;
+
+  /// Raw disparity below `skyRatio * p99` counts as sky. Depth Anything
+  /// returns ~0 for sky, while indoor back walls stay well above this.
+  final double skyRatio;
 
   /// Focal length = focalFactor * long side (≈ 64° field of view, typical of
   /// a phone main camera).
@@ -37,19 +49,24 @@ class SceneBuildOptions {
   /// A triangle is torn when its farthest vertex is this many times farther
   /// than its nearest one. Using a depth *ratio* (not a disparity difference)
   /// keeps steep but smooth near surfaces (a face, a cat's back) intact while
-  /// separating objects and breaking blurry grazing-angle stretches into
-  /// characteristic-colored particles.
+  /// separating objects from what is behind them.
   final double tearRatio;
 
   /// A point counts as an occluder when its local background is at least
   /// this many times farther away.
   final double occluderRatio;
 
+  /// Guided-filter radius (depth-map pixels) and regularization used to snap
+  /// depth edges onto color edges of the photo.
+  final int guideRadius;
+  final double guideEps;
+
+  /// Width of the soft "beyond the frame" extension, as a fraction of the
+  /// grid, so turning your head does not hit a hard black cut.
+  final double ringFraction;
+
   final int textureLongSide;
   final int backgroundTextureLongSide;
-
-  /// Soft cap on generated particles in occluded / torn regions.
-  final int maxParticles;
 }
 
 /// Builds a [PhotoScene] from a decoded photo and its depth map.
@@ -75,6 +92,11 @@ class SceneBuilder {
     rawTexture.dispose();
 
     final Uint8List bgRgba = await imageToRgba(photo, bgSize.w, bgSize.h);
+    final Uint8List guideRgba = await imageToRgba(
+      photo,
+      depth.width,
+      depth.height,
+    );
 
     final _MeshResult r = await compute(
       _buildMeshes,
@@ -82,6 +104,7 @@ class SceneBuilder {
         disparity: depth.values,
         dw: depth.width,
         dh: depth.height,
+        guideRgba: guideRgba,
         imageWidth: photo.width,
         imageHeight: photo.height,
         fgRgba: fgRgba,
@@ -94,27 +117,30 @@ class SceneBuilder {
       ),
     );
 
-    final ui.Image texture = await rgbaToImage(r.fgRgba, tw, th);
     final bool needsNativePng =
         !kIsWeb &&
         (defaultTargetPlatform == TargetPlatform.iOS ||
             defaultTargetPlatform == TargetPlatform.android);
-    final Uint8List fgPng =
-        needsNativePng ? await encodePng(texture) : Uint8List(0);
+
+    final ui.Image texture = await rgbaToImage(r.fgRgba, tw, th);
     final SceneLayer fg = SceneLayer(
       positions: r.fgPositions,
       uvs: r.uvs,
       indices: r.fgIndices,
       texture: texture,
-      texturePng: fgPng,
+      texturePng: needsNativePng ? await encodePng(texture) : Uint8List(0),
     );
 
-    ParticleCloud? particles;
-    if (r.particleSizes.isNotEmpty) {
-      particles = ParticleCloud(
-        positions: r.particlePositions,
-        colors: r.particleColors,
-        sizes: r.particleSizes,
+    SceneLayer? bg;
+    if (r.bgIndices.isNotEmpty) {
+      final ui.Image bgImage = await rgbaToImage(r.bgRgba, bgSize.w, bgSize.h);
+      bg = SceneLayer(
+        positions: r.bgPositions,
+        uvs: r.bgUvs,
+        indices: r.bgIndices,
+        alphas: r.bgAlphas,
+        texture: bgImage,
+        texturePng: needsNativePng ? await encodePng(bgImage) : Uint8List(0),
       );
     }
 
@@ -129,7 +155,7 @@ class SceneBuilder {
 
     return PhotoScene(
       foreground: fg,
-      particles: particles,
+      background: bg,
       introParticles: introParticles,
       imageWidth: photo.width,
       imageHeight: photo.height,
@@ -143,6 +169,7 @@ class _MeshInput {
     required this.disparity,
     required this.dw,
     required this.dh,
+    required this.guideRgba,
     required this.imageWidth,
     required this.imageHeight,
     required this.fgRgba,
@@ -157,6 +184,7 @@ class _MeshInput {
   final Float32List disparity;
   final int dw;
   final int dh;
+  final Uint8List guideRgba;
   final int imageWidth;
   final int imageHeight;
   final Uint8List fgRgba;
@@ -174,9 +202,11 @@ class _MeshResult {
     required this.uvs,
     required this.fgIndices,
     required this.fgRgba,
-    required this.particlePositions,
-    required this.particleColors,
-    required this.particleSizes,
+    required this.bgPositions,
+    required this.bgUvs,
+    required this.bgAlphas,
+    required this.bgIndices,
+    required this.bgRgba,
     required this.introPositions,
     required this.introColors,
     required this.introSizes,
@@ -186,20 +216,27 @@ class _MeshResult {
   final Float32List uvs;
   final Int32List fgIndices;
   final Uint8List fgRgba;
-  final Float32List particlePositions;
-  final Uint8List particleColors;
-  final Float32List particleSizes;
+  final Float32List bgPositions;
+  final Float32List bgUvs;
+  final Float32List bgAlphas;
+  final Int32List bgIndices;
+  final Uint8List bgRgba;
   final Float32List introPositions;
   final Uint8List introColors;
   final Float32List introSizes;
 }
 
+double _percentile(Float32List values, double p) {
+  final Float32List sorted = Float32List.fromList(values)..sort();
+  if (sorted.isEmpty) return 0;
+  return sorted[(sorted.length * p).floor().clamp(0, sorted.length - 1)];
+}
+
 /// Exposed for tests.
 @visibleForTesting
 Float32List normalizeDisparity(Float32List d) {
-  final Float32List sorted = Float32List.fromList(d)..sort();
-  final double lo = sorted[(sorted.length * 0.01).floor()];
-  final double hi = sorted[math.min(sorted.length - 1, (sorted.length * 0.99).floor())];
+  final double lo = _percentile(d, 0.01);
+  final double hi = _percentile(d, 0.99);
   final double range = math.max(1e-6, hi - lo);
   final Float32List out = Float32List(d.length);
   for (int i = 0; i < d.length; i++) {
@@ -210,9 +247,48 @@ Float32List normalizeDisparity(Float32List d) {
 
 _MeshResult _buildMeshes(_MeshInput input) {
   final SceneBuildOptions o = input.options;
-  final Float32List dn = normalizeDisparity(input.disparity);
+  final int dw = input.dw, dh = input.dh;
+  final Float32List raw = input.disparity;
 
-  // Grid resolution follows the photo's aspect ratio.
+  // 1. Sky detection on the raw model output, then normalize the rest of the
+  //    scene so its nearest/farthest points map to near/far meters.
+  final double p99 = _percentile(raw, 0.99);
+  final Float32List sky = Float32List(dw * dh);
+  final List<double> nonSky = <double>[];
+  for (int i = 0; i < raw.length; i++) {
+    if (raw[i] < o.skyRatio * p99) {
+      sky[i] = 1;
+    } else {
+      nonSky.add(raw[i]);
+    }
+  }
+  final Float32List nonSkyList = Float32List.fromList(
+    nonSky.isEmpty ? <double>[0, 1] : nonSky,
+  );
+  final double lo = _percentile(nonSkyList, 0.01);
+  final double hi = _percentile(nonSkyList, 0.99);
+  final double range = math.max(1e-6, hi - lo);
+  Float32List dn = Float32List(raw.length);
+  for (int i = 0; i < raw.length; i++) {
+    dn[i] = ((raw[i] - lo) / range).clamp(0.0, 1.0);
+  }
+
+  // 2. Snap depth edges to the photo's color edges (guided filter). The
+  //    model predicts at ~518 px, so its edges are soft and slightly off;
+  //    without this, objects tear a few pixels away from their outline and
+  //    drag background pixels along (dark/ghost fringes).
+  final Float32List guide = Float32List(dw * dh);
+  for (int i = 0; i < dw * dh; i++) {
+    final int p = i * 4;
+    guide[i] =
+        (0.299 * input.guideRgba[p] +
+            0.587 * input.guideRgba[p + 1] +
+            0.114 * input.guideRgba[p + 2]) /
+        255.0;
+  }
+  dn = guidedFilter(dn, guide, dw, dh, o.guideRadius, o.guideEps);
+
+  // 3. Sample onto the mesh grid.
   final bool landscape = input.imageWidth >= input.imageHeight;
   final double aspect = input.imageWidth / input.imageHeight;
   final int gw = landscape
@@ -222,55 +298,41 @@ _MeshResult _buildMeshes(_MeshInput input) {
       ? math.max(8, (o.gridLongSide / aspect).round())
       : o.gridLongSide;
   final int n = gw * gh;
+  final Float32List g = _resample(dn, dw, dh, gw, gh);
+  final Float32List skyG = _resample(sky, dw, dh, gw, gh);
 
-  // Sample normalized disparity on the grid (bilinear).
-  final Float32List g = Float32List(n);
-  for (int y = 0; y < gh; y++) {
-    final double sy = y / (gh - 1) * (input.dh - 1);
-    final int y0 = sy.floor();
-    final int y1 = math.min(input.dh - 1, y0 + 1);
-    final double fy = sy - y0;
-    for (int x = 0; x < gw; x++) {
-      final double sx = x / (gw - 1) * (input.dw - 1);
-      final int x0 = sx.floor();
-      final int x1 = math.min(input.dw - 1, x0 + 1);
-      final double fx = sx - x0;
-      final double a = dn[y0 * input.dw + x0];
-      final double b = dn[y0 * input.dw + x1];
-      final double c = dn[y1 * input.dw + x0];
-      final double d = dn[y1 * input.dw + x1];
-      g[y * gw + x] =
-          (a * (1 - fx) + b * fx) * (1 - fy) + (c * (1 - fx) + d * fx) * fy;
-    }
-  }
-
-  // Local background disparity: the farthest surface within a wide radius
-  // (using O(N) sliding-window min filter), smoothed. Pixels clearly nearer
-  // than it are occluders.
-  final int radius = math.max(3, (gw * 0.16).round());
-  Float32List bgG = minFilter(g, gw, gh, radius);
-  final int blurR = math.max(1, (gw * 0.025).round());
-  bgG = boxBlur(boxBlur(bgG, gw, gh, blurR), gw, gh, blurR);
-  for (int i = 0; i < n; i++) {
-    if (bgG[i] > g[i]) bgG[i] = g[i];
-  }
+  // Work in inverse depth q = 1/z (meters^-1): linear in disparity, and a
+  // plane in the world is linear in q across the image — handy for the
+  // beyond-the-frame extrapolation below.
   final double invNear = 1.0 / o.nearMeters;
   final double invFar = 1.0 / o.farMeters;
-  double toZ(double disp) => 1.0 / (disp * (invNear - invFar) + invFar);
+  final double invSky = 1.0 / o.skyMeters;
+  final Float32List q = Float32List(n);
+  for (int i = 0; i < n; i++) {
+    final double qScene = g[i] * (invNear - invFar) + invFar;
+    // Soft blend at the horizon so the skyline tears cleanly.
+    q[i] = skyG[i] > 0.5 ? invSky : qScene;
+  }
   final Float32List zg = Float32List(n);
+  for (int i = 0; i < n; i++) {
+    zg[i] = 1.0 / q[i];
+  }
+
+  // 4. Local background: the farthest surface within a wide radius,
+  //    smoothed. Points clearly nearer than it are occluders.
+  final int radius = math.max(3, (gw * 0.16).round());
+  Float32List qbg = minFilter(q, gw, gh, radius);
+  final int blurR = math.max(1, (gw * 0.025).round());
+  qbg = boxBlur(boxBlur(qbg, gw, gh, blurR), gw, gh, blurR);
+  for (int i = 0; i < n; i++) {
+    if (qbg[i] > q[i]) qbg[i] = q[i];
+  }
   final Float32List zbg = Float32List(n);
   for (int i = 0; i < n; i++) {
-    zg[i] = toZ(g[i]);
-    zbg[i] = toZ(bgG[i]);
+    zbg[i] = 1.0 / qbg[i];
   }
 
-  final Uint8List occ = Uint8List(n);
-  for (int i = 0; i < n; i++) {
-    if (zbg[i] > zg[i] * o.occluderRatio) occ[i] = 1;
-  }
-  final Uint8List bgMask = dilate(occ, gw, gh, 2);
-
-  // Unproject grid vertices with a pinhole model.
+  // 5. Foreground mesh: pinhole unprojection.
   final double imgW = input.imageWidth.toDouble();
   final double imgH = input.imageHeight.toDouble();
   final double f = o.focalFactor * math.max(imgW, imgH);
@@ -293,9 +355,10 @@ _MeshResult _buildMeshes(_MeshInput input) {
     }
   }
 
-  // Triangulate; tear the foreground where depth jumps or stretches steeply.
+  // Triangulate; tear the foreground where depth jumps.
   final List<int> fgIdx = <int>[];
   final Uint8List tornCell = Uint8List(n);
+  final Uint8List nearSide = Uint8List(n);
   void addTri(int a, int b, int c) {
     final double za = zg[a], zb = zg[b], zc = zg[c];
     final double zMax = math.max(za, math.max(zb, zc));
@@ -309,6 +372,11 @@ _MeshResult _buildMeshes(_MeshInput input) {
       tornCell[a] = 1;
       tornCell[b] = 1;
       tornCell[c] = 1;
+      // Vertices on the near side of the break stand in front of something.
+      final double split = zMin * math.sqrt(o.tearRatio);
+      if (za < split) nearSide[a] = 1;
+      if (zb < split) nearSide[b] = 1;
+      if (zc < split) nearSide[c] = 1;
     }
   }
 
@@ -338,6 +406,7 @@ _MeshResult _buildMeshes(_MeshInput input) {
         final int vx = vi % gw, vy = vi ~/ gw;
         return vx == 0 || vx == gw - 1 || vy == 0 || vy == gh - 1;
       }
+
       final int maxAllowed = pass == 0 ? 2 : 1;
       final bool spike =
           (deg[a] <= maxAllowed && tornCell[a] == 1 && !isBorderVertex(a)) ||
@@ -357,8 +426,51 @@ _MeshResult _buildMeshes(_MeshInput input) {
     activeIdx = pruned;
   }
 
-  // Build tight rounded-corner alpha feathering on torn occluder boundaries
-  // plus gentle rounded outer corners so every 3D seam transitions smoothly.
+  // Occluders: nearer than their local background AND close to an actual
+  // depth break. A smoothly receding floor is "nearer than the far trees"
+  // too, but nothing is hidden behind it, so it must keep its real texture.
+  final Uint8List nearEdge = dilate(
+    tornCell,
+    gw,
+    gh,
+    math.max(2, (gw * 0.04).round()),
+  );
+  final Uint8List occ = Uint8List(n);
+  for (int i = 0; i < n; i++) {
+    if (nearEdge[i] == 1 && zbg[i] > zg[i] * o.occluderRatio) occ[i] = 1;
+  }
+
+  // What is behind an occluder is best guessed from its immediate
+  // surroundings (the floor around someone's feet, the wall beside their
+  // head), not from the farthest point in a wide radius.
+  // Everything that stands in front of its surroundings gets a
+  // hidden-surface depth, so the background layer never mixes near and far
+  // vertices in one triangle.
+  final Uint8List nearSideWide = dilate(nearSide, gw, gh, 1);
+  // Objects = regions cut off from the rest of the scene by tears and lying
+  // on the near side of them (a cat, a person, a whole stop sign). A floor
+  // or a blanket recedes smoothly into the wall behind it, so it stays
+  // connected to the background and is never treated as an object.
+  final Uint8List objects = _or(
+    findOccluderObjects(zg, gw, gh, o.tearRatio),
+    findOccluderSpans(zg, gw, gh, o.tearRatio),
+  );
+  final Uint8List hiddenMask = Uint8List(n);
+  for (int i = 0; i < n; i++) {
+    if (objects[i] == 1 || (nearSideWide[i] == 1 && zg[i] < zbg[i])) {
+      hiddenMask[i] = 1;
+    }
+  }
+  final Float32List qHidden = pushPullScalar(q, hiddenMask, gw, gh);
+  final Float32List zHidden = Float32List(n);
+  for (int i = 0; i < n; i++) {
+    final double qh = hiddenMask[i] == 1 ? math.min(qHidden[i], q[i]) : q[i];
+    zHidden[i] = 1.0 / qh;
+  }
+
+  // Soft alpha on torn silhouettes and rounded outer corners. The background
+  // layer below keeps the original pixels along these seams, so the start
+  // view still reproduces the photo exactly.
   final Float32List fgKeep = Float32List(n);
   for (final int vi in activeIdx) {
     fgKeep[vi] = 1.0;
@@ -382,13 +494,18 @@ _MeshResult _buildMeshes(_MeshInput input) {
       final int x0 = gx.floor(), x1 = math.min(gw - 1, x0 + 1);
       final double fx = gx - x0;
 
-      // Subtle rounded corners on the outer frame in 3D space.
       double outerAlpha = 1.0;
       if ((px < outerRadiusPx || px > tw - 1 - outerRadiusPx) &&
           (py < outerRadiusPx || py > th - 1 - outerRadiusPx)) {
-        final double cx = px < outerRadiusPx ? outerRadiusPx : tw - 1 - outerRadiusPx;
-        final double cy = py < outerRadiusPx ? outerRadiusPx : th - 1 - outerRadiusPx;
-        final double d = math.sqrt((px - cx) * (px - cx) + (py - cy) * (py - cy));
+        final double cx = px < outerRadiusPx
+            ? outerRadiusPx
+            : tw - 1 - outerRadiusPx;
+        final double cy = py < outerRadiusPx
+            ? outerRadiusPx
+            : th - 1 - outerRadiusPx;
+        final double d = math.sqrt(
+          (px - cx) * (px - cx) + (py - cy) * (py - cy),
+        );
         if (d > outerRadiusPx - 2.0) {
           outerAlpha = ((outerRadiusPx - d) / 2.0).clamp(0.0, 1.0);
         }
@@ -418,54 +535,192 @@ _MeshResult _buildMeshes(_MeshInput input) {
 
       final double finalAlpha = math.min(outerAlpha, seamAlpha);
       if (finalAlpha < 0.999) {
-        fgRgbaOut[(py * tw + px) * 4 + 3] =
-            (finalAlpha * 255.0).round().clamp(0, 255);
+        fgRgbaOut[(py * tw + px) * 4 + 3] = (finalAlpha * 255.0)
+            .round()
+            .clamp(0, 255);
       }
     }
   }
 
-  // Erode occluder mask to erase foreground colors from the inner hole,
-  // then compute push-pull fallback colors.
-  final Uint8List holeGrid = erode(occ, gw, gh, 1);
-  final Uint8List hole = Uint8List(input.bw * input.bh);
-  for (int y = 0; y < input.bh; y++) {
-    final int gy = (y / (input.bh - 1) * (gh - 1)).round();
-    for (int x = 0; x < input.bw; x++) {
-      final int gx = (x / (input.bw - 1) * (gw - 1)).round();
-      hole[y * input.bw + x] = holeGrid[gy * gw + gx];
+  // 6. Background layer, part A — what is hidden behind objects: a smooth
+  //    surface at the local background depth, textured with an inpainted
+  //    copy of the photo (objects erased, texture continued from the
+  //    surrounding background), so moving sideways reveals a plausible wall
+  //    / floor / foliage instead of a black hole.
+  final Uint8List fillMask = dilate(
+    _or(hiddenMask, tornCell),
+    gw,
+    gh,
+    2,
+  );
+  final List<double> bgPosList = <double>[];
+  final List<double> bgUvList = <double>[];
+  final List<double> bgAlphaList = <double>[];
+  final List<int> bgIdx = <int>[];
+
+  final Int32List holeVert = Int32List(n)..fillRange(0, n, -1);
+  int addBgVertex(double u, double v, double z, double tu, double tv, double a) {
+    final double px = (u - 0.5) * imgW / f;
+    final double py = (v - 0.5) * imgH / f;
+    bgPosList
+      ..add(px * z)
+      ..add(-py * z)
+      ..add(-z);
+    bgUvList
+      ..add(tu)
+      ..add(tv);
+    bgAlphaList.add(a);
+    return bgAlphaList.length - 1;
+  }
+
+  int holeVertex(int x, int y) {
+    final int i = y * gw + x;
+    if (holeVert[i] >= 0) return holeVert[i];
+    final double u = x / (gw - 1), v = y / (gh - 1);
+    // Pushed back a hair so it never z-fights the foreground.
+    return holeVert[i] = addBgVertex(u, v, zHidden[i] * 1.01, u, v, 1.0);
+  }
+
+  for (int y = 0; y < gh - 1; y++) {
+    for (int x = 0; x < gw - 1; x++) {
+      final int tl = y * gw + x;
+      if (fillMask[tl] == 0 &&
+          fillMask[tl + 1] == 0 &&
+          fillMask[tl + gw] == 0 &&
+          fillMask[tl + gw + 1] == 0) {
+        continue;
+      }
+      final int a = holeVertex(x, y), b = holeVertex(x + 1, y);
+      final int c = holeVertex(x, y + 1), d = holeVertex(x + 1, y + 1);
+      bgIdx
+        ..add(a)
+        ..add(c)
+        ..add(b)
+        ..add(b)
+        ..add(c)
+        ..add(d);
     }
   }
-  final Uint8List filled = pushPullFill(
+
+  // Part B — beyond the frame: continue the scene's own surfaces past the
+  // photo edges (planes extrapolated in inverse depth, mirrored texture),
+  // fading out, so the photo stops looking like a card floating in a void
+  // when you turn or look down at the floor.
+  final int ring = math.max(2, (gw * o.ringFraction).round());
+  // The floor under your feet is never in the photo: extend further down.
+  final int ringBottom = ring * 2;
+  final int ew = gw + ring * 2, eh = gh + ring + ringBottom;
+  const int slopeSpan = 6;
+  double qAt(int x, int y) => q[y.clamp(0, gh - 1) * gw + x.clamp(0, gw - 1)];
+  double extrapolatedQ(int gx, int gy) {
+    final int cx = gx.clamp(0, gw - 1), cy = gy.clamp(0, gh - 1);
+    final double edge = qAt(cx, cy);
+    if (skyG[cy * gw + cx] > 0.5) return invSky;
+    double out = edge;
+    if (gx < 0 || gx > gw - 1) {
+      final int dir = gx < 0 ? 1 : -1; // inward
+      final double slope = (edge - qAt(cx + dir * slopeSpan, cy)) / slopeSpan;
+      out += slope * (gx < 0 ? -gx : gx - (gw - 1));
+    }
+    if (gy < 0 || gy > gh - 1) {
+      final int dir = gy < 0 ? 1 : -1;
+      final double slope = (edge - qAt(cx, cy + dir * slopeSpan)) / slopeSpan;
+      out += slope * (gy < 0 ? -gy : gy - (gh - 1));
+    }
+    // Keep it physical: no closer than 0.35 m, no farther than the sky,
+    // and at most 2x the edge change either way.
+    return out.clamp(math.max(invSky, edge * 0.5), math.min(1 / 0.35, edge * 2));
+  }
+
+  double mirror(double t) {
+    if (t < 0) return math.min(1.0, -t);
+    if (t > 1) return math.max(0.0, 2 - t);
+    return t;
+  }
+
+  final Int32List ringVert = Int32List(ew * eh)..fillRange(0, ew * eh, -1);
+  int ringVertex(int ex, int ey) {
+    final int k = ey * ew + ex;
+    if (ringVert[k] >= 0) return ringVert[k];
+    final int gx = ex - ring, gy = ey - ring;
+    final double u = gx / (gw - 1), v = gy / (gh - 1);
+    final double z = 1.0 / extrapolatedQ(gx, gy);
+    final double outside = math.max(
+      math.max(-gx, gx - (gw - 1)).toDouble(),
+      math.max(-gy / ring * ring, (gy - (gh - 1)) * ring / ringBottom),
+    );
+    final double t = (1.0 - outside / ring).clamp(0.0, 1.0);
+    final double alpha = outside <= 0 ? 1.0 : t * t * (3 - 2 * t);
+    return ringVert[k] = addBgVertex(u, v, z, mirror(u), mirror(v), alpha);
+  }
+
+  for (int ey = 0; ey < eh - 1; ey++) {
+    for (int ex = 0; ex < ew - 1; ex++) {
+      final int gx = ex - ring, gy = ey - ring;
+      final bool inside = gx >= 0 && gy >= 0 && gx < gw - 1 && gy < gh - 1;
+      if (inside) continue;
+      final int a = ringVertex(ex, ey), b = ringVertex(ex + 1, ey);
+      final int c = ringVertex(ex, ey + 1), d = ringVertex(ex + 1, ey + 1);
+      bgIdx
+        ..add(a)
+        ..add(c)
+        ..add(b)
+        ..add(b)
+        ..add(c)
+        ..add(d);
+    }
+  }
+
+  // Inpainted background texture. The outermost occluder cell keeps its
+  // original pixels so torn seams look identical to the photo at the start.
+  // Occluder pixels (and torn seams) are never used as source material.
+  // For the smooth (low-frequency) part, also avoid everything in
+  // [hiddenMask] (e.g. the inside of a big stop sign), so no object color
+  // bleeds into what is behind it.
+  // Only erase/inpaint where the foreground is fully opaque at the start
+  // view. Wherever it is torn or feathered, the background layer keeps the
+  // photo's own pixels, so the first frame is exactly the photo.
+  final Uint8List seamBand = dilate(tornCell, gw, gh, 1);
+  final Uint8List holeGrid = Uint8List(n);
+  for (int i = 0; i < n; i++) {
+    if (hiddenMask[i] == 1 && seamBand[i] == 0) holeGrid[i] = 1;
+  }
+  final Uint8List notSourceGrid = dilate(
+    _or(hiddenMask, tornCell),
+    gw,
+    gh,
+    1,
+  );
+  final int bw = input.bw, bh = input.bh;
+  final Uint8List hole = Uint8List(bw * bh);
+  final Uint8List notSource = Uint8List(bw * bh);
+  final Uint8List notSmoothSource = Uint8List(bw * bh);
+  final Float32List zTex = Float32List(bw * bh);
+  final Float32List zHiddenTex = Float32List(bw * bh);
+  for (int y = 0; y < bh; y++) {
+    final int gy = (y / (bh - 1) * (gh - 1)).round();
+    for (int x = 0; x < bw; x++) {
+      final int gx = (x / (bw - 1) * (gw - 1)).round();
+      final int gi = gy * gw + gx, ti = y * bw + x;
+      hole[ti] = holeGrid[gi];
+      notSource[ti] = notSourceGrid[gi];
+      notSmoothSource[ti] =
+          notSourceGrid[gi] == 1 || hiddenMask[gi] == 1 ? 1 : 0;
+      zTex[ti] = zg[gi];
+      zHiddenTex[ti] = zHidden[gi];
+    }
+  }
+  final Uint8List filled = inpaintTexture(
     input.bgRgba,
     hole,
-    input.bw,
-    input.bh,
+    bw,
+    bh,
+    notSource: notSource,
+    notSmoothSource: notSmoothSource,
+    depth: zTex,
+    hiddenDepth: zHiddenTex,
   );
 
-  // Replace the blurry occluded / torn regions with crisp characteristic-colored
-  // 3D particles sampled directly from surrounding valid background pixels.
-  final ({Float32List pos, Uint8List col, Float32List size}) particles =
-      _buildParticles(
-        gw: gw,
-        gh: gh,
-        imgW: imgW,
-        imgH: imgH,
-        f: f,
-        zbg: zbg,
-        occ: occ,
-        bgMask: bgMask,
-        tornCell: tornCell,
-        holeGrid: holeGrid,
-        origRgba: input.bgRgba,
-        filledRgba: filled,
-        bw: input.bw,
-        bh: input.bh,
-        maxParticles: o.maxParticles,
-      );
-
-  // Build 3D surface assembly particles sampled across the reconstructed 3D
-  // foreground mesh so the intro animation can fly particles straight to their
-  // exact 3D model coordinates.
   final ({Float32List pos, Uint8List col, Float32List size}) intro =
       _buildIntroParticles(
         gw: gw,
@@ -484,13 +739,352 @@ _MeshResult _buildMeshes(_MeshInput input) {
     uvs: uvs,
     fgIndices: Int32List.fromList(activeIdx),
     fgRgba: fgRgbaOut,
-    particlePositions: particles.pos,
-    particleColors: particles.col,
-    particleSizes: particles.size,
+    bgPositions: Float32List.fromList(bgPosList),
+    bgUvs: Float32List.fromList(bgUvList),
+    bgAlphas: Float32List.fromList(bgAlphaList),
+    bgIndices: Int32List.fromList(bgIdx),
+    bgRgba: filled,
     introPositions: intro.pos,
     introColors: intro.col,
     introSizes: intro.size,
   );
+}
+
+/// Splits the grid into surfaces connected without depth breaks and returns
+/// a mask of the ones that are objects standing in front of something: on
+/// the near side of most of their breaks, and not the main background.
+@visibleForTesting
+Uint8List findOccluderObjects(Float32List z, int w, int h, double tearRatio) {
+  final int n = w * h;
+  final Int32List parent = Int32List(n);
+  for (int i = 0; i < n; i++) {
+    parent[i] = i;
+  }
+  int find(int i) {
+    while (parent[i] != i) {
+      parent[i] = parent[parent[i]];
+      i = parent[i];
+    }
+    return i;
+  }
+
+  bool joined(int a, int b) {
+    final double za = z[a], zb = z[b];
+    return math.max(za, zb) <= math.min(za, zb) * tearRatio;
+  }
+
+  for (int y = 0; y < h; y++) {
+    for (int x = 0; x < w; x++) {
+      final int i = y * w + x;
+      if (x + 1 < w && joined(i, i + 1)) parent[find(i)] = find(i + 1);
+      if (y + 1 < h && joined(i, i + w)) parent[find(i)] = find(i + w);
+    }
+  }
+
+  final Int32List size = Int32List(n);
+  final Int32List nearVotes = Int32List(n);
+  final Int32List farVotes = Int32List(n);
+  for (int i = 0; i < n; i++) {
+    size[find(i)]++;
+  }
+  void vote(int a, int b) {
+    if (joined(a, b)) return;
+    final int near = z[a] < z[b] ? a : b;
+    final int far = near == a ? b : a;
+    nearVotes[find(near)]++;
+    farVotes[find(far)]++;
+  }
+
+  for (int y = 0; y < h; y++) {
+    for (int x = 0; x < w; x++) {
+      final int i = y * w + x;
+      if (x + 1 < w) vote(i, i + 1);
+      if (y + 1 < h) vote(i, i + w);
+    }
+  }
+
+  int largest = 0;
+  for (int i = 0; i < n; i++) {
+    if (size[i] > size[largest]) largest = i;
+  }
+  final Uint8List out = Uint8List(n);
+  for (int i = 0; i < n; i++) {
+    final int r = find(i);
+    if (r == largest) continue;
+    if (nearVotes[r] > 0 && nearVotes[r] >= farVotes[r]) out[i] = 1;
+  }
+  return out;
+}
+
+/// Scan-line object detection for things that touch the ground (people,
+/// poles, signs): along each row and column, the span between stepping onto
+/// a nearer surface and stepping back off it is an object. A floor recedes
+/// along the view direction and never produces such a span.
+@visibleForTesting
+Uint8List findOccluderSpans(Float32List z, int w, int h, double tearRatio) {
+  final Uint8List out = Uint8List(w * h);
+  void scan(int count, int len, int Function(int line, int k) at) {
+    final List<int> starts = <int>[];
+    for (int line = 0; line < count; line++) {
+      starts.clear();
+      for (int k = 0; k + 1 < len; k++) {
+        final double a = z[at(line, k)], b = z[at(line, k + 1)];
+        if (b * tearRatio < a) {
+          starts.add(k + 1); // stepped onto something nearer
+        } else if (a * tearRatio < b && starts.isNotEmpty) {
+          final int s = starts.removeLast(); // stepped back off it
+          if (k - s + 1 <= len * 0.6) {
+            for (int j = s; j <= k; j++) {
+              out[at(line, j)] = 1;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  scan(h, w, (int y, int x) => y * w + x);
+  scan(w, h, (int x, int y) => y * w + x);
+  return out;
+}
+
+Uint8List _or(Uint8List a, Uint8List b) {
+  final Uint8List out = Uint8List(a.length);
+  for (int i = 0; i < a.length; i++) {
+    out[i] = (a[i] | b[i]) != 0 ? 1 : 0;
+  }
+  return out;
+}
+
+/// Bilinear resample of a [sw]x[sh] map onto a [dw]x[dh] grid whose corner
+/// samples align with the source corners.
+Float32List _resample(Float32List src, int sw, int sh, int dw, int dh) {
+  final Float32List out = Float32List(dw * dh);
+  for (int y = 0; y < dh; y++) {
+    final double sy = y / (dh - 1) * (sh - 1);
+    final int y0 = sy.floor();
+    final int y1 = math.min(sh - 1, y0 + 1);
+    final double fy = sy - y0;
+    for (int x = 0; x < dw; x++) {
+      final double sx = x / (dw - 1) * (sw - 1);
+      final int x0 = sx.floor();
+      final int x1 = math.min(sw - 1, x0 + 1);
+      final double fx = sx - x0;
+      out[y * dw + x] =
+          (src[y0 * sw + x0] * (1 - fx) + src[y0 * sw + x1] * fx) * (1 - fy) +
+          (src[y1 * sw + x0] * (1 - fx) + src[y1 * sw + x1] * fx) * fy;
+    }
+  }
+  return out;
+}
+
+/// Box mean with an integral image, O(N) for any radius.
+Float32List _boxMean(Float32List src, int w, int h, int r) {
+  final Float64List integral = Float64List((w + 1) * (h + 1));
+  for (int y = 0; y < h; y++) {
+    double row = 0;
+    for (int x = 0; x < w; x++) {
+      row += src[y * w + x];
+      integral[(y + 1) * (w + 1) + x + 1] = integral[y * (w + 1) + x + 1] + row;
+    }
+  }
+  final Float32List out = Float32List(w * h);
+  for (int y = 0; y < h; y++) {
+    final int y0 = math.max(0, y - r), y1 = math.min(h - 1, y + r) + 1;
+    for (int x = 0; x < w; x++) {
+      final int x0 = math.max(0, x - r), x1 = math.min(w - 1, x + r) + 1;
+      final double sum =
+          integral[y1 * (w + 1) + x1] -
+          integral[y0 * (w + 1) + x1] -
+          integral[y1 * (w + 1) + x0] +
+          integral[y0 * (w + 1) + x0];
+      out[y * w + x] = sum / ((x1 - x0) * (y1 - y0));
+    }
+  }
+  return out;
+}
+
+/// Guided filter (He et al.) with a grayscale guide: edge-preserving
+/// smoothing of [p] that transfers the edges of [guide] into the result.
+@visibleForTesting
+Float32List guidedFilter(
+  Float32List p,
+  Float32List guide,
+  int w,
+  int h,
+  int r,
+  double eps,
+) {
+  if (r <= 0) return p;
+  final int n = w * h;
+  final Float32List ip = Float32List(n), ii = Float32List(n);
+  for (int i = 0; i < n; i++) {
+    ip[i] = guide[i] * p[i];
+    ii[i] = guide[i] * guide[i];
+  }
+  final Float32List meanI = _boxMean(guide, w, h, r);
+  final Float32List meanP = _boxMean(p, w, h, r);
+  final Float32List meanIp = _boxMean(ip, w, h, r);
+  final Float32List meanII = _boxMean(ii, w, h, r);
+  final Float32List a = Float32List(n), b = Float32List(n);
+  for (int i = 0; i < n; i++) {
+    final double varI = meanII[i] - meanI[i] * meanI[i];
+    final double covIp = meanIp[i] - meanI[i] * meanP[i];
+    a[i] = covIp / (varI + eps);
+    b[i] = meanP[i] - a[i] * meanI[i];
+  }
+  final Float32List meanA = _boxMean(a, w, h, r);
+  final Float32List meanB = _boxMean(b, w, h, r);
+  final Float32List out = Float32List(n);
+  for (int i = 0; i < n; i++) {
+    out[i] = (meanA[i] * guide[i] + meanB[i]).clamp(0.0, 1.0);
+  }
+  return out;
+}
+
+/// Fills [hole] pixels with texture continued from both sides of each hole
+/// (mirror-reflected along the row, nearer side weighted more), blended with
+/// a smooth push-pull fill for the low frequencies. Keeps grain — wood floor,
+/// leaves, brick — instead of a blurry smear.
+@visibleForTesting
+Uint8List inpaintTexture(
+  Uint8List rgba,
+  Uint8List hole,
+  int w,
+  int h, {
+  Uint8List? notSource,
+  Uint8List? notSmoothSource,
+  Float32List? depth,
+  Float32List? hiddenDepth,
+}) {
+  final Uint8List avoid = notSource ?? hole;
+  // Smooth fill computed from allowed sources only, applied to the hole.
+  final Uint8List smooth = pushPullFill(rgba, notSmoothSource ?? avoid, w, h);
+  final Uint8List low = Uint8List.fromList(rgba);
+  for (int i = 0; i < w * h; i++) {
+    if (hole[i] == 1) {
+      for (int c = 0; c < 4; c++) {
+        low[i * 4 + c] = smooth[i * 4 + c];
+      }
+    }
+  }
+  final Uint8List out = Uint8List.fromList(low);
+  final Uint8List done = Uint8List(w * h);
+  bool valid(int x, int y) => x >= 0 && x < w && avoid[y * w + x] == 0;
+  // A source may fill a hole pixel only if it is (roughly) as far away as
+  // the surface hidden there — never a nearer object.
+  bool deepEnough(int src, int dst) =>
+      depth == null ||
+      hiddenDepth == null ||
+      depth[src] >= hiddenDepth[dst] * 0.85;
+
+  for (int y = 0; y < h; y++) {
+    int x = 0;
+    while (x < w) {
+      if (hole[y * w + x] == 0) {
+        x++;
+        continue;
+      }
+      final int a = x;
+      while (x < w && hole[y * w + x] == 1) {
+        x++;
+      }
+      final int b = x - 1; // hole run [a, b]
+      // Nearest allowed source pixel on each side of the run.
+      final int mid = y * w + (a + b) ~/ 2;
+      int xl = a - 1, xr = b + 1;
+      while (xl >= 0 &&
+          (avoid[y * w + xl] == 1 || !deepEnough(y * w + xl, mid))) {
+        xl--;
+      }
+      while (xr < w &&
+          (avoid[y * w + xr] == 1 || !deepEnough(y * w + xr, mid))) {
+        xr++;
+      }
+      for (int px = a; px <= b; px++) {
+        final int dl = px - xl, dr = xr - px;
+        final int sl = xl - dl + 1, sr = xr + dr - 1;
+        final int here = y * w + px;
+        final bool hasL =
+            xl >= 0 && sl >= 0 && valid(sl, y) && deepEnough(y * w + sl, here);
+        final bool hasR =
+            xr < w && sr < w && valid(sr, y) && deepEnough(y * w + sr, here);
+        double wl = hasL ? (dr * dr).toDouble() : 0;
+        double wr = hasR ? (dl * dl).toDouble() : 0;
+        final double sum = wl + wr;
+        if (sum <= 0) continue; // keep push-pull value
+        wl /= sum;
+        wr /= sum;
+        final int o = (y * w + px) * 4;
+        final int ol = (y * w + (hasL ? sl : 0)) * 4;
+        final int orr = (y * w + (hasR ? sr : 0)) * 4;
+        for (int c = 0; c < 3; c++) {
+          final double refl =
+              (hasL ? rgba[ol + c] * wl : 0) + (hasR ? rgba[orr + c] * wr : 0);
+          // Mostly real texture, a bit of smooth fill to hide seams.
+          out[o + c] = (refl * 0.75 + low[o + c] * 0.25).round().clamp(0, 255);
+        }
+        out[o + 3] = 255;
+        done[here] = 1;
+      }
+    }
+  }
+
+  // Same idea vertically for whatever the row pass could not reach (holes
+  // that span the full width of their surroundings).
+  for (int x = 0; x < w; x++) {
+    int y = 0;
+    while (y < h) {
+      final int i0 = y * w + x;
+      if (hole[i0] == 0 || done[i0] == 1) {
+        y++;
+        continue;
+      }
+      final int a = y;
+      while (y < h && hole[y * w + x] == 1 && done[y * w + x] == 0) {
+        y++;
+      }
+      final int b = y - 1;
+      final int mid = ((a + b) ~/ 2) * w + x;
+      int yt = a - 1, yb = b + 1;
+      while (yt >= 0 &&
+          (avoid[yt * w + x] == 1 || !deepEnough(yt * w + x, mid))) {
+        yt--;
+      }
+      while (yb < h &&
+          (avoid[yb * w + x] == 1 || !deepEnough(yb * w + x, mid))) {
+        yb++;
+      }
+      for (int py = a; py <= b; py++) {
+        final int here = py * w + x;
+        final int dt = py - yt, db = yb - py;
+        final int st = yt - dt + 1, sb = yb + db - 1;
+        bool ok(int sy) =>
+            sy >= 0 &&
+            sy < h &&
+            avoid[sy * w + x] == 0 &&
+            deepEnough(sy * w + x, here);
+        final bool hasT = yt >= 0 && ok(st);
+        final bool hasB = yb < h && ok(sb);
+        double wt = hasT ? (db * db).toDouble() : 0;
+        double wb = hasB ? (dt * dt).toDouble() : 0;
+        final double sum = wt + wb;
+        if (sum <= 0) continue;
+        wt /= sum;
+        wb /= sum;
+        final int o = here * 4;
+        final int ot = (hasT ? st * w + x : 0) * 4;
+        final int ob = (hasB ? sb * w + x : 0) * 4;
+        for (int c = 0; c < 3; c++) {
+          final double refl =
+              (hasT ? rgba[ot + c] * wt : 0) + (hasB ? rgba[ob + c] * wb : 0);
+          out[o + c] = (refl * 0.75 + low[o + c] * 0.25).round().clamp(0, 255);
+        }
+        out[o + 3] = 255;
+      }
+    }
+  }
+  return out;
 }
 
 ({Float32List pos, Uint8List col, Float32List size}) _buildIntroParticles({
@@ -535,287 +1129,6 @@ _MeshResult _buildMeshes(_MeshInput input) {
 
       outSize[count] = angularR * zg[vi];
       count++;
-    }
-  }
-
-  return (
-    pos: Float32List.sublistView(outPos, 0, count * 3),
-    col: Uint8List.sublistView(outCol, 0, count * 4),
-    size: Float32List.sublistView(outSize, 0, count),
-  );
-}
-
-({Float32List pos, Uint8List col, Float32List size}) _buildParticles({
-  required int gw,
-  required int gh,
-  required double imgW,
-  required double imgH,
-  required double f,
-  required Float32List zbg,
-  required Uint8List occ,
-  required Uint8List bgMask,
-  required Uint8List tornCell,
-  required Uint8List holeGrid,
-  required Uint8List origRgba,
-  required Uint8List filledRgba,
-  required int bw,
-  required int bh,
-  required int maxParticles,
-}) {
-  final int n = gw * gh;
-  final Uint8List particleMask = Uint8List(n);
-  int maskedCells = 0;
-  for (int i = 0; i < n; i++) {
-    if (bgMask[i] == 1 || tornCell[i] == 1) {
-      particleMask[i] = 1;
-      maskedCells++;
-    }
-  }
-  if (maskedCells == 0) {
-    return (
-      pos: Float32List(0),
-      col: Uint8List(0),
-      size: Float32List(0),
-    );
-  }
-
-  // Cells strictly belonging to genuine background (not inside occluders or
-  // torn foreground edges) provide crisp characteristic color samples.
-  final Uint8List validBg = Uint8List(n);
-  int validCount = 0;
-  for (int i = 0; i < n; i++) {
-    if (occ[i] == 0 && tornCell[i] == 0) {
-      validBg[i] = 1;
-      validCount++;
-    }
-  }
-  if (validCount == 0) {
-    for (int i = 0; i < n; i++) {
-      if (holeGrid[i] == 0) {
-        validBg[i] = 1;
-        validCount++;
-      }
-    }
-  }
-
-  // Precompute 8-directional nearest valid background cells in O(N).
-  const List<int> dirDx = <int>[-1, 1, 0, 0, -1, 1, -1, 1];
-  const List<int> dirDy = <int>[0, 0, -1, 1, -1, -1, 1, 1];
-  final List<Int32List> hitIdx = List<Int32List>.generate(
-    8,
-    (_) => Int32List(n)..fillRange(0, n, -1),
-  );
-  final List<Int32List> hitDist = List<Int32List>.generate(
-    8,
-    (_) => Int32List(n)..fillRange(0, n, 1 << 20),
-  );
-
-  for (int d = 0; d < 8; d++) {
-    final int dx = dirDx[d];
-    final int dy = dirDy[d];
-    final Int32List hi = hitIdx[d];
-    final Int32List hd = hitDist[d];
-    // Sweep in the direction opposite to (dx, dy) so neighbor (x + dx, y + dy)
-    // is already computed.
-    final int xStart = dx > 0 ? gw - 1 : 0;
-    final int xEnd = dx > 0 ? -1 : gw;
-    final int xStep = dx > 0 ? -1 : 1;
-    final int yStart = dy > 0 ? gh - 1 : 0;
-    final int yEnd = dy > 0 ? -1 : gh;
-    final int yStep = dy > 0 ? -1 : 1;
-
-    for (int y = yStart; y != yEnd; y += yStep) {
-      for (int x = xStart; x != xEnd; x += xStep) {
-        final int i = y * gw + x;
-        if (validBg[i] == 1) {
-          hi[i] = i;
-          hd[i] = 0;
-          continue;
-        }
-        final int nx = x + dx;
-        final int ny = y + dy;
-        if (nx >= 0 && nx < gw && ny >= 0 && ny < gh) {
-          final int ni = ny * gw + nx;
-          if (hi[ni] >= 0) {
-            hi[i] = hi[ni];
-            hd[i] = hd[ni] + 1;
-          }
-        }
-      }
-    }
-  }
-
-  // Pack more small uniform particles cleanly in a stratified sub-grid.
-  final int samplesPerCell;
-  final int cellStep;
-  if (maskedCells * 4 <= maxParticles) {
-    samplesPerCell = 4;
-    cellStep = 1;
-  } else if (maskedCells * 3 <= maxParticles) {
-    samplesPerCell = 3;
-    cellStep = 1;
-  } else if (maskedCells * 2 <= maxParticles) {
-    samplesPerCell = 2;
-    cellStep = 1;
-  } else if (maskedCells <= maxParticles) {
-    samplesPerCell = 1;
-    cellStep = 1;
-  } else {
-    samplesPerCell = 1;
-    cellStep = math.max(2, math.sqrt(maskedCells / maxParticles).ceil());
-  }
-
-  final int capacity = maskedCells * samplesPerCell;
-  final Float32List outPos = Float32List(capacity * 3);
-  final Uint8List outCol = Uint8List(capacity * 4);
-  final Float32List outSize = Float32List(capacity);
-
-  double hash01(int a, int b, int c) {
-    int h = a * 374761393 + b * 668265263 + c * 2147483647;
-    h = (h ^ (h >> 13)) * 1274126177;
-    h ^= (h >> 16);
-    return (h & 0x00FFFFFF) / 16777216.0;
-  }
-
-  double sampleZbg(double gx, double gy) {
-    final double cx = gx.clamp(0.0, (gw - 1).toDouble());
-    final double cy = gy.clamp(0.0, (gh - 1).toDouble());
-    final int x0 = cx.floor();
-    final int y0 = cy.floor();
-    final int x1 = math.min(gw - 1, x0 + 1);
-    final int y1 = math.min(gh - 1, y0 + 1);
-    final double fx = cx - x0;
-    final double fy = cy - y0;
-    final double a = zbg[y0 * gw + x0];
-    final double b = zbg[y0 * gw + x1];
-    final double c = zbg[y1 * gw + x0];
-    final double d = zbg[y1 * gw + x1];
-    return (a * (1 - fx) + b * fx) * (1 - fy) + (c * (1 - fx) + d * fx) * fy;
-  }
-
-  final List<int> candRgb = List<int>.filled(24, 0);
-  final List<double> candWeight = List<double>.filled(8, 0.0);
-
-  // Uniform angular particle radius so every particle has the exact same
-  // crisp small size.
-  final double uniformAngularRadius = (imgW / f) / gw * 0.22;
-
-  int count = 0;
-  for (int gy = 0; gy < gh; gy += cellStep) {
-    for (int gx = 0; gx < gw; gx += cellStep) {
-      final int cellIdx = gy * gw + gx;
-      if (particleMask[cellIdx] == 0) continue;
-
-      // Gather directional characteristic background colors around this cell.
-      int candCount = 0;
-      double weightSum = 0.0;
-      for (int d = 0; d < 8; d++) {
-        final int hit = hitIdx[d][cellIdx];
-        if (hit < 0) continue;
-        int hx = hit % gw;
-        int hy = hit ~/ gw;
-        // Step deeper into valid background to avoid edge fringe.
-        for (int step = 0; step < 3; step++) {
-          final int sx = hx + dirDx[d];
-          final int sy = hy + dirDy[d];
-          if (sx >= 0 && sx < gw && sy >= 0 && sy < gh && validBg[sy * gw + sx] == 1) {
-            hx = sx;
-            hy = sy;
-          } else {
-            break;
-          }
-        }
-        final int bx = (hx / (gw - 1) * (bw - 1)).round().clamp(0, bw - 1);
-        final int by = (hy / (gh - 1) * (bh - 1)).round().clamp(0, bh - 1);
-        final int p = (by * bw + bx) * 4;
-        final double w = 1.0 / (hitDist[d][cellIdx] + 1.5);
-        candRgb[candCount * 3] = origRgba[p];
-        candRgb[candCount * 3 + 1] = origRgba[p + 1];
-        candRgb[candCount * 3 + 2] = origRgba[p + 2];
-        candWeight[candCount] = w;
-        weightSum += w;
-        candCount++;
-      }
-
-      final int fbx = (gx / (gw - 1) * (bw - 1)).round().clamp(0, bw - 1);
-      final int fby = (gy / (gh - 1) * (bh - 1)).round().clamp(0, bh - 1);
-      final int fp = (fby * bw + fbx) * 4;
-      final int baseR = filledRgba[fp];
-      final int baseG = filledRgba[fp + 1];
-      final int baseB = filledRgba[fp + 2];
-
-      for (int s = 0; s < samplesPerCell; s++) {
-        if (count >= capacity) break;
-        // Stratified sub-cell positions (2x2 for 4 samples, diagonal for 2-3).
-        final double baseOx;
-        final double baseOy;
-        if (samplesPerCell == 4) {
-          baseOx = (s % 2 == 0) ? -0.26 : 0.26;
-          baseOy = (s < 2) ? -0.26 : 0.26;
-        } else if (samplesPerCell == 3) {
-          baseOx = (s - 1) * 0.28;
-          baseOy = (s == 1 ? -0.26 : 0.22);
-        } else if (samplesPerCell == 2) {
-          baseOx = s == 0 ? -0.24 : 0.24;
-          baseOy = s == 0 ? 0.24 : -0.24;
-        } else {
-          baseOx = 0.0;
-          baseOy = 0.0;
-        }
-        final double jx = (baseOx + (hash01(gx, gy, s * 7 + 1) - 0.5) * 0.56) * cellStep;
-        final double jy = (baseOy + (hash01(gx, gy, s * 7 + 2) - 0.5) * 0.56) * cellStep;
-        final double jz = hash01(gx, gy, s * 7 + 3) * 0.045;
-        final double jc = hash01(gx, gy, s * 7 + 5);
-        final double jb = hash01(gx, gy, s * 7 + 6);
-
-        final double sgx = (gx + jx).clamp(0.0, (gw - 1).toDouble());
-        final double sgy = (gy + jy).clamp(0.0, (gh - 1).toDouble());
-        final double u = sgx / (gw - 1);
-        final double v = sgy / (gh - 1);
-        final double px = (u - 0.5) * imgW / f;
-        final double py = (v - 0.5) * imgH / f;
-        final double z = sampleZbg(sgx, sgy) * (1.01 + jz);
-
-        outPos[count * 3] = px * z;
-        outPos[count * 3 + 1] = -py * z;
-        outPos[count * 3 + 2] = -z;
-
-        // Every particle has identical uniform crisp small radius.
-        outSize[count] = uniformAngularRadius * z;
-
-        // Pick a pure characteristic pixel color from surrounding background rays.
-        int r = baseR;
-        int g = baseG;
-        int b = baseB;
-        if (candCount > 0 && weightSum > 0) {
-          double target = jc * weightSum;
-          int picked = candCount - 1;
-          for (int k = 0; k < candCount; k++) {
-            target -= candWeight[k];
-            if (target <= 0) {
-              picked = k;
-              break;
-            }
-          }
-          r = candRgb[picked * 3];
-          g = candRgb[picked * 3 + 1];
-          b = candRgb[picked * 3 + 2];
-        }
-
-        // Clean, crisp characteristic hue without blurry muddiness.
-        final double lum = 0.299 * r + 0.587 * g + 0.114 * b;
-        const double satBoost = 1.18;
-        final double bright = 0.92 + jb * 0.18;
-        final int fr = ((lum + (r - lum) * satBoost) * bright).round().clamp(0, 255);
-        final int fg = ((lum + (g - lum) * satBoost) * bright).round().clamp(0, 255);
-        final int fb = ((lum + (b - lum) * satBoost) * bright).round().clamp(0, 255);
-
-        outCol[count * 4] = fr;
-        outCol[count * 4 + 1] = fg;
-        outCol[count * 4 + 2] = fb;
-        outCol[count * 4 + 3] = 242;
-        count++;
-      }
     }
   }
 
@@ -933,6 +1246,75 @@ Uint8List erode(Uint8List mask, int w, int h, int r) {
   final Uint8List out = Uint8List(mask.length);
   for (int i = 0; i < mask.length; i++) {
     out[i] = grown[i] == 0 ? 1 : 0;
+  }
+  return out;
+}
+
+/// Push-pull fill of a scalar field: values where [hole] == 1 are replaced
+/// by a smooth interpolation of the surrounding valid values.
+@visibleForTesting
+Float32List pushPullScalar(Float32List src, Uint8List hole, int w, int h) {
+  final List<Float32List> vs = <Float32List>[];
+  final List<Float32List> ws = <Float32List>[];
+  final List<int> lw = <int>[w], lh = <int>[h];
+  final Float32List v0 = Float32List(w * h), w0 = Float32List(w * h);
+  for (int i = 0; i < w * h; i++) {
+    if (hole[i] == 0) {
+      v0[i] = src[i];
+      w0[i] = 1;
+    }
+  }
+  vs.add(v0);
+  ws.add(w0);
+  while (lw.last > 1 || lh.last > 1) {
+    final int pw = lw.last, ph = lh.last;
+    final int nw = math.max(1, (pw + 1) ~/ 2), nh = math.max(1, (ph + 1) ~/ 2);
+    final Float32List pv = vs.last, pwt = ws.last;
+    final Float32List nv = Float32List(nw * nh), nwt = Float32List(nw * nh);
+    for (int y = 0; y < nh; y++) {
+      for (int x = 0; x < nw; x++) {
+        double sv = 0, sw = 0;
+        for (int dy = 0; dy < 2; dy++) {
+          final int yy = math.min(ph - 1, y * 2 + dy);
+          for (int dx = 0; dx < 2; dx++) {
+            final int j = yy * pw + math.min(pw - 1, x * 2 + dx);
+            sv += pv[j] * pwt[j];
+            sw += pwt[j];
+          }
+        }
+        if (sw > 0) nv[y * nw + x] = sv / sw;
+        nwt[y * nw + x] = math.min(1.0, sw);
+      }
+    }
+    vs.add(nv);
+    ws.add(nwt);
+    lw.add(nw);
+    lh.add(nh);
+  }
+  for (int l = vs.length - 2; l >= 0; l--) {
+    final int cw = lw[l], ch = lh[l], uw = lw[l + 1], uh = lh[l + 1];
+    final Float32List cv = vs[l], cwt = ws[l], uv = vs[l + 1];
+    for (int y = 0; y < ch; y++) {
+      final double sy = math.max(0.0, math.min(uh - 1.0, (y + 0.5) / 2 - 0.5));
+      final int y0 = sy.floor(), y1 = math.min(uh - 1, y0 + 1);
+      final double fy = sy - y0;
+      for (int x = 0; x < cw; x++) {
+        final int k = y * cw + x;
+        if (cwt[k] >= 1) continue;
+        final double sx = math.max(0.0, math.min(uw - 1.0, (x + 0.5) / 2 - 0.5));
+        final int x0 = sx.floor(), x1 = math.min(uw - 1, x0 + 1);
+        final double fx = sx - x0;
+        final double up =
+            (uv[y0 * uw + x0] * (1 - fx) + uv[y0 * uw + x1] * fx) * (1 - fy) +
+            (uv[y1 * uw + x0] * (1 - fx) + uv[y1 * uw + x1] * fx) * fy;
+        cv[k] = cv[k] * cwt[k] + up * (1 - cwt[k]);
+        cwt[k] = 1;
+      }
+    }
+  }
+  final Float32List out = Float32List.fromList(src);
+  for (int i = 0; i < w * h; i++) {
+    if (hole[i] == 1) out[i] = vs[0][i];
   }
   return out;
 }

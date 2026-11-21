@@ -91,7 +91,7 @@ class ArViewController {
           <String, Object>{
             'positions': l.positions,
             'uvs': l.uvs,
-            'indices': l.indices,
+            'indices': _opaqueIndices(l),
             'texture': l.texturePng,
           },
       ],
@@ -102,6 +102,25 @@ class ArViewController {
           'sizes': particles.sizes,
         },
     });
+  }
+
+  /// In AR the real room is the backdrop, so the soft beyond-the-frame
+  /// extension (faded via vertex alpha, which the native renderers do not
+  /// use) is left out: only fully opaque triangles are sent.
+  static Int32List _opaqueIndices(SceneLayer l) {
+    final Float32List? a = l.alphas;
+    if (a == null) return l.indices;
+    final List<int> keep = <int>[];
+    final Int32List idx = l.indices;
+    for (int t = 0; t < idx.length; t += 3) {
+      if (a[idx[t]] >= 0.999 && a[idx[t + 1]] >= 0.999 && a[idx[t + 2]] >= 0.999) {
+        keep
+          ..add(idx[t])
+          ..add(idx[t + 1])
+          ..add(idx[t + 2]);
+      }
+    }
+    return Int32List.fromList(keep);
   }
 
   /// Re-anchors the scene at the phone's current pose.

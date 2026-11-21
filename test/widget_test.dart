@@ -165,7 +165,7 @@ void main() {
   });
 
   testWidgets('scene: foreground torn at depth edges, occluded regions filled '
-      'with characteristic-colored particles, start view reproduces photo, '
+      'by an inpainted background layer, start view reproduces photo, '
       'walking adds parallax', (
     WidgetTester tester,
   ) async {
@@ -180,30 +180,28 @@ void main() {
       // Torn: fewer foreground triangles than a full grid.
       const int gw = 64, gh = 48;
       expect(scene.foreground.triangleCount, lessThan((gw - 1) * (gh - 1) * 2));
-      expect(scene.particles, isNotNull);
-      expect(scene.particles!.count, greaterThan(0));
+      expect(scene.background, isNotNull);
+      expect(scene.background!.alphas, isNotNull);
 
       // The box is nearer than the wall.
       double zAt(SceneLayer l, int gx, int gy) =>
           l.positions[(gy * gw + gx) * 3 + 2];
       expect(zAt(scene.foreground, 32, 24), greaterThan(zAt(scene.foreground, 2, 2)));
 
-      // Particles behind the box are deeper than the box itself, and carry
-      // surrounding wall colors (red/blue) rather than the box's green.
-      final ParticleCloud cloud = scene.particles!;
+      // The background layer has geometry behind the box (farther than the
+      // box) and fades out past the photo frame.
+      final SceneLayer bgl = scene.background!;
       bool foundBehindBox = false;
-      for (int i = 0; i < cloud.count; i++) {
-        final double pz = cloud.positions[i * 3 + 2];
-        if (pz < zAt(scene.foreground, 32, 24)) {
+      for (int i = 0; i < bgl.vertexCount; i++) {
+        final double x = bgl.positions[i * 3], y = bgl.positions[i * 3 + 1];
+        final double z = bgl.positions[i * 3 + 2];
+        if (x.abs() < 0.3 && y.abs() < 0.3 &&
+            z < zAt(scene.foreground, 32, 24) - 0.5) {
           foundBehindBox = true;
-          final int r = cloud.colors[i * 4];
-          final int g = cloud.colors[i * 4 + 1];
-          final int b = cloud.colors[i * 4 + 2];
-          expect(r > g || b > g, isTrue);
-          break;
         }
       }
       expect(foundBehindBox, isTrue);
+      expect(bgl.alphas!.reduce(math.min), lessThan(0.05));
 
       // Start pose: screen == photo (box center green, left wall red).
       const Size size = Size(320, 240);
@@ -213,8 +211,8 @@ void main() {
       expect((await _pixel(frame, 30, 120))[0], greaterThan(150));
 
       // Step right: the near box shifts left much more than the far wall,
-      // revealing background particles at center (160) while the box sits
-      // shifted left around x = 32..75.
+      // revealing the inpainted wall (not green) at center (160) while the
+      // box sits shifted left around x = 32..75.
       cam.x = 0.6;
       frame = await _render(scene, cam, size);
       final List<int> c = await _pixel(frame, 160, 120);
@@ -271,7 +269,7 @@ void main() {
         }
         // ignore: avoid_print
         print('fg tris ${scene.foreground.triangleCount}, '
-            'particles ${scene.particles?.count}, '
+            'bg tris ${scene.background?.triangleCount}, '
             'depth ${dw}x$dh, focal ${scene.focalPx.toStringAsFixed(0)}, '
             'max z ${scene.foreground.positions.reduce(math.min).toStringAsFixed(2)}');
         scene.dispose();

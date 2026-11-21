@@ -48,7 +48,7 @@ class ScenePainter extends CustomPainter {
     final double cyw = math.cos(camera.yaw);
     final _View view = _View(
       x: camera.x + sy * zPullback,
-      y: camera.y,
+      y: camera.eyeY,
       z: camera.z + cyw * zPullback,
       yaw: camera.yaw,
       pitch: camera.pitch,
@@ -342,7 +342,10 @@ class ScenePainter extends CustomPainter {
     int out = 0; // output triangle count
 
     final Float32List polyX = b.polyX, polyY = b.polyY, polyZ = b.polyZ;
-    final Float32List polyU = b.polyU, polyV = b.polyV;
+    final Float32List polyU = b.polyU, polyV = b.polyV, polyA = b.polyA;
+    final Float32List? al = layer.alphas;
+    int argb(double a) =>
+        ((a * 255).round().clamp(0, 255) << 24) | 0x00FFFFFF;
 
     void emitPolygon(int count) {
       // Project polygon vertices.
@@ -378,6 +381,11 @@ class ScenePainter extends CustomPainter {
         b.sTex[o + 3] = polyV[k] * th;
         b.sTex[o + 4] = polyU[k + 1] * tw;
         b.sTex[o + 5] = polyV[k + 1] * th;
+        if (al != null) {
+          b.sCol[out * 3] = argb(polyA[0]);
+          b.sCol[out * 3 + 1] = argb(polyA[k]);
+          b.sCol[out * 3 + 2] = argb(polyA[k + 1]);
+        }
         b.key[out] = depth;
         out++;
       }
@@ -398,6 +406,7 @@ class ScenePainter extends CustomPainter {
           polyZ[k] = b.cz[vi];
           polyU[k] = uv[vi * 2];
           polyV[k] = uv[vi * 2 + 1];
+          polyA[k] = al == null ? 1.0 : al[vi];
         }
         emitPolygon(3);
         continue;
@@ -416,6 +425,7 @@ class ScenePainter extends CustomPainter {
           polyZ[count] = z0;
           polyU[count] = uv[i0 * 2];
           polyV[count] = uv[i0 * 2 + 1];
+          polyA[count] = al == null ? 1.0 : al[i0];
           count++;
         }
         if (in0 != in1) {
@@ -426,6 +436,7 @@ class ScenePainter extends CustomPainter {
           polyU[count] = uv[i0 * 2] + (uv[i1 * 2] - uv[i0 * 2]) * s;
           polyV[count] =
               uv[i0 * 2 + 1] + (uv[i1 * 2 + 1] - uv[i0 * 2 + 1]) * s;
+          polyA[count] = al == null ? 1.0 : al[i0] + (al[i1] - al[i0]) * s;
           count++;
         }
       }
@@ -456,6 +467,11 @@ class ScenePainter extends CustomPainter {
         b.oPos[o + j] = b.sPos[s + j];
         b.oTex[o + j] = b.sTex[s + j];
       }
+      if (al != null) {
+        b.oCol[dst * 3] = b.sCol[i * 3];
+        b.oCol[dst * 3 + 1] = b.sCol[i * 3 + 1];
+        b.oCol[dst * 3 + 2] = b.sCol[i * 3 + 2];
+      }
     }
 
     b.paint.colorFilter = opacity >= 0.999
@@ -469,8 +485,14 @@ class ScenePainter extends CustomPainter {
       VertexMode.triangles,
       Float32List.sublistView(b.oPos, 0, out * 6),
       textureCoordinates: Float32List.sublistView(b.oTex, 0, out * 6),
+      colors: al == null ? null : Int32List.sublistView(b.oCol, 0, out * 3),
     );
-    canvas.drawVertices(vertices, BlendMode.srcOver, b.paint);
+    // With vertex colors, modulate multiplies the texture by white-with-alpha.
+    canvas.drawVertices(
+      vertices,
+      al == null ? BlendMode.srcOver : BlendMode.modulate,
+      b.paint,
+    );
     vertices.dispose();
   }
 
@@ -629,8 +651,10 @@ class _LayerBuffers {
   final Float32List polyZ = Float32List(8);
   final Float32List polyU = Float32List(8);
   final Float32List polyV = Float32List(8);
+  final Float32List polyA = Float32List(8);
 
   Float32List sPos = Float32List(0), sTex = Float32List(0);
+  Int32List sCol = Int32List(0), oCol = Int32List(0);
   Float32List oPos = Float32List(0), oTex = Float32List(0);
   Float32List key = Float32List(0);
   Int32List bucketOf = Int32List(0);
@@ -643,6 +667,8 @@ class _LayerBuffers {
         Float32List(len)..setRange(0, old.length, old);
     sPos = grow(sPos, cap * 6);
     sTex = grow(sTex, cap * 6);
+    sCol = Int32List(cap * 3)..setRange(0, sCol.length, sCol);
+    oCol = Int32List(cap * 3);
     oPos = Float32List(cap * 6);
     oTex = Float32List(cap * 6);
     key = grow(key, cap);

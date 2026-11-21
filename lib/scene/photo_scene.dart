@@ -13,6 +13,7 @@ class SceneLayer {
     required this.indices,
     required this.texture,
     required this.texturePng,
+    this.alphas,
   });
 
   /// xyz per vertex.
@@ -29,6 +30,10 @@ class SceneLayer {
 
   /// PNG-encoded texture for the native AR renderers.
   final Uint8List texturePng;
+
+  /// Optional per-vertex opacity in [0, 1] (used to fade the
+  /// beyond-the-frame extension out into the void).
+  final Float32List? alphas;
 
   int get vertexCount => positions.length ~/ 3;
   int get triangleCount => indices.length ~/ 3;
@@ -62,13 +67,15 @@ class ParticleCloud {
 ///
 /// [foreground] is the photo itself, unprojected with the estimated depth and
 /// torn apart at depth discontinuities (so a person does not get "rubber
-/// sheeted" onto the wall behind them). [particles] fills the occluded and
-/// blurry torn-edge regions that open up once you move, using small 3D
-/// particles carrying characteristic colors sampled from the surrounding scene.
+/// sheeted" onto the wall behind them). [background] is a continuous surface
+/// behind objects (inpainted texture at the local background depth) plus a
+/// soft continuation past the photo's edges, so moving reveals plausible
+/// scenery instead of holes.
 class PhotoScene {
   PhotoScene({
     required this.foreground,
-    required this.particles,
+    this.background,
+    this.particles,
     this.introParticles,
     required this.imageWidth,
     required this.imageHeight,
@@ -76,6 +83,9 @@ class PhotoScene {
   });
 
   final SceneLayer foreground;
+  final SceneLayer? background;
+
+  /// Optional extra particle fill (not produced by the default builder).
   final ParticleCloud? particles;
 
   /// Dense 3D surface particles sampled across the reconstructed 3D model,
@@ -89,9 +99,11 @@ class PhotoScene {
   /// Focal length (in source-photo pixels) used to unproject the photo.
   final double focalPx;
 
-  List<SceneLayer> get layers => <SceneLayer>[foreground];
+  /// Back to front: background first, then the photo itself.
+  List<SceneLayer> get layers => <SceneLayer>[?background, foreground];
 
   void dispose() {
     foreground.dispose();
+    background?.dispose();
   }
 }
