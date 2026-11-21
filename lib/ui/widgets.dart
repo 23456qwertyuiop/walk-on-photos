@@ -1,7 +1,8 @@
-import 'dart:math' as math;
-import 'dart:ui' as ui;
-
 import 'package:material_ui/material_ui.dart';
+
+import '../render/fly_camera.dart';
+import '../render/scene_painter.dart';
+import '../scene/photo_scene.dart';
 
 const Color kAccent = Color(0xFF7FE7D9);
 
@@ -148,19 +149,22 @@ class AddPhotoCard extends StatelessWidget {
   }
 }
 
-/// Animates the chosen photo flying piece-by-piece into the frame while the
-/// 3D scene is being reconstructed (no spinner or loading text).
+/// Black-screen fade -> build 3D model first -> ~3s 3D reveal where particles
+/// fly in 3D space straight to their exact 3D model positions ahead of the
+/// viewer, then glide forward into the interactive 3D scene.
 class PhotoFlyInOverlay extends StatefulWidget {
   const PhotoFlyInOverlay({
     super.key,
-    required this.image,
+    required this.scene,
     required this.busy,
     required this.version,
+    this.hasError = false,
   });
 
-  final ui.Image? image;
+  final PhotoScene? scene;
   final bool busy;
   final int version;
+  final bool hasError;
 
   @override
   State<PhotoFlyInOverlay> createState() => _PhotoFlyInOverlayState();
@@ -168,19 +172,30 @@ class PhotoFlyInOverlay extends StatefulWidget {
 
 class _PhotoFlyInOverlayState extends State<PhotoFlyInOverlay>
     with TickerProviderStateMixin {
-  late final AnimationController _flyCtrl;
-  late final AnimationController _fadeCtrl;
+  late final AnimationController _blackCtrl;
+  late final AnimationController _revealCtrl;
+  late final AnimationController _glideCtrl;
+  final FlyCamera _introCam = FlyCamera();
+
   bool _active = false;
-  ui.Image? _shownImage;
+  bool _revealing = false;
+  int _activeVersion = -1;
+  PhotoScene? _revealScene;
 
   @override
   void initState() {
     super.initState();
-    _flyCtrl = AnimationController(vsync: this);
-    _fadeCtrl = AnimationController(
+    _blackCtrl = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 240),
-      value: 0.0,
+      duration: const Duration(milliseconds: 220),
+    );
+    _revealCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 3000),
+    );
+    _glideCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 480),
     );
     _syncState();
   }
@@ -190,217 +205,135 @@ class _PhotoFlyInOverlayState extends State<PhotoFlyInOverlay>
     super.didUpdateWidget(oldWidget);
     if (widget.version != oldWidget.version ||
         widget.busy != oldWidget.busy ||
-        widget.image != oldWidget.image) {
-      _syncState(oldBusy: oldWidget.busy, oldVersion: oldWidget.version);
+        widget.scene != oldWidget.scene ||
+        widget.hasError != oldWidget.hasError) {
+      _syncState();
     }
   }
 
-  void _syncState({bool oldBusy = false, int oldVersion = -1}) {
-    if (widget.busy) {
-      if (widget.image != null &&
-          (!_active || widget.version != oldVersion || !oldBusy)) {
-        _active = true;
-        _shownImage = widget.image;
-        _fadeCtrl.value = 1.0;
-        _flyCtrl.stop();
-        _flyCtrl.value = 0.0;
-        // Fly ~86% of tiles in over 1.35s, then drift slowly toward 96% if
-        // model inference is still running on slower devices.
-        _flyCtrl
-            .animateTo(
-              0.86,
-              duration: const Duration(milliseconds: 1350),
-              curve: Curves.easeOutQuad,
-            )
-            .then((_) {
-              if (mounted && widget.busy) {
-                _flyCtrl.animateTo(
-                  0.96,
-                  duration: const Duration(milliseconds: 3000),
-                  curve: Curves.linear,
-                );
-              }
-            });
-      }
-    } else if (_active) {
-      // Scene finished building: snap remaining tiles into place, then dissolve
-      // smoothly into the live 3D scene.
-      _flyCtrl
-          .animateTo(
-            1.0,
-            duration: const Duration(milliseconds: 260),
-            curve: Curves.easeOutCubic,
-          )
-          .then((_) {
-            if (!mounted || widget.busy) return;
-            _fadeCtrl.reverse().then((_) {
-              if (mounted && !widget.busy) {
-                setState(() {
-                  _active = false;
-                  _shownImage = null;
-                });
-              }
-            });
-          });
+  void _syncState() {
+    if (widget.busy && (!_active || widget.version != _activeVersion)) {
+      _active = true;
+      _revealing = false;
+      _activeVersion = widget.version;
+      _revealScene = null;
+      _revealCtrl.stop();
+      _revealCtrl.value = 0.0;
+      _glideCtrl.stop();
+      _glideCtrl.value = 0.0;
+
+      // 1. First black out the screen ("先黑场") while the 3D model loads.
+      _blackCtrl.forward(from: 0.0).then((_) {
+        if (mounted && _active && !widget.busy && !_revealing) {
+          _begin3DReveal();
+        }
+      });
+      return;
     }
+
+    if (_active && !widget.busy && !_revealing) {
+      if (widget.hasError || widget.scene == null) {
+        _abortToIdle();
+      } else if (!_blackCtrl.isAnimating) {
+        _begin3DReveal();
+      }
+    }
+  }
+
+  void _begin3DReveal() {
+    if (!mounted || !_active || _revealing || widget.busy) return;
+    final PhotoScene? s = widget.scene;
+    if (widget.hasError || s == null) {
+      _abortToIdle();
+      return;
+    }
+
+    _revealing = true;
+    _revealScene = s;
+
+    // 2. Once the 3D model is built, fly particles directly into their exact
+    // 3D coordinates over ~3s while the 3D model fades in ahead of you.
+    final int startedVersion = _activeVersion;
+    _revealCtrl.forward(from: 0.0).then((_) {
+      if (!mounted || !_active || _activeVersion != startedVersion) return;
+      // 3. Glide smoothly forward from ahead (+1.65m) to the start viewpoint.
+      _glideCtrl.forward(from: 0.0).then((_) {
+        if (mounted && !widget.busy && _activeVersion == startedVersion) {
+          setState(() {
+            _active = false;
+            _revealing = false;
+            _revealScene = null;
+          });
+        }
+      });
+    });
+  }
+
+  void _abortToIdle() {
+    if (!mounted || !_active) return;
+    final int startedVersion = _activeVersion;
+    _blackCtrl.reverse().then((_) {
+      if (mounted && !widget.busy && _activeVersion == startedVersion) {
+        setState(() {
+          _active = false;
+          _revealing = false;
+          _revealScene = null;
+        });
+      }
+    });
   }
 
   @override
   void dispose() {
-    _flyCtrl.dispose();
-    _fadeCtrl.dispose();
+    _blackCtrl.dispose();
+    _revealCtrl.dispose();
+    _glideCtrl.dispose();
+    _introCam.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    final ui.Image? img = _shownImage ?? widget.image;
-    if (!_active || img == null) return const SizedBox.shrink();
+    if (!_active) return const SizedBox.shrink();
 
     return IgnorePointer(
       child: AnimatedBuilder(
-        animation: Listenable.merge(<Listenable>[_flyCtrl, _fadeCtrl]),
+        animation: Listenable.merge(<Listenable>[
+          _blackCtrl,
+          _revealCtrl,
+          _glideCtrl,
+        ]),
         builder: (BuildContext context, _) {
-          if (_fadeCtrl.value <= 0.001) return const SizedBox.shrink();
-          return CustomPaint(
-            painter: _PhotoFlyInPainter(
-              image: img,
-              progress: _flyCtrl.value,
-              masterOpacity: _fadeCtrl.value,
-            ),
-            size: Size.infinite,
+          final double glideT = Curves.easeInOutCubic.transform(_glideCtrl.value);
+          final double blackAlpha =
+              (_blackCtrl.value * (1.0 - glideT)).clamp(0.0, 1.0);
+          if (blackAlpha <= 0.001 && glideT >= 0.999) {
+            return const SizedBox.shrink();
+          }
+          final PhotoScene? scene = _revealScene;
+          final double zPullback = 1.65 * (1.0 - glideT);
+          return Stack(
+            fit: StackFit.expand,
+            children: <Widget>[
+              ColoredBox(
+                color: Color.fromRGBO(0, 0, 0, blackAlpha),
+              ),
+              if (scene != null && _revealCtrl.value > 0.001)
+                CustomPaint(
+                  painter: ScenePainter(
+                    scene: scene,
+                    camera: _introCam,
+                    reveal: _revealCtrl.value,
+                    zPullback: zPullback,
+                  ),
+                  size: Size.infinite,
+                ),
+            ],
           );
         },
       ),
     );
   }
-}
-
-class _PhotoFlyInPainter extends CustomPainter {
-  _PhotoFlyInPainter({
-    required this.image,
-    required this.progress,
-    required this.masterOpacity,
-  });
-
-  final ui.Image image;
-  final double progress;
-  final double masterOpacity;
-
-  static double _hash01(int a, int b, int c) {
-    int h = a * 374761393 + b * 668265263 + c * 2147483647;
-    h = (h ^ (h >> 13)) * 1274126177;
-    h ^= (h >> 16);
-    return (h & 0x00FFFFFF) / 16777216.0;
-  }
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    if (size.isEmpty || masterOpacity <= 0.0) return;
-
-    final double iw = image.width.toDouble();
-    final double ih = image.height.toDouble();
-    // Cover-fit rectangle matching ScenePainter's starting camera projection.
-    final double cover = math.max(size.width / iw, size.height / ih);
-    final double dstW = iw * cover;
-    final double dstH = ih * cover;
-    final double ox = (size.width - dstW) * 0.5;
-    final double oy = (size.height - dstH) * 0.5;
-    final double screenCx = size.width * 0.5;
-    final double screenCy = size.height * 0.5;
-
-    final bool landscape = iw >= ih;
-    const int longTiles = 18;
-    final int cols = landscape
-        ? longTiles
-        : math.max(8, (longTiles * iw / ih).round());
-    final int rows = landscape
-        ? math.max(8, (longTiles * ih / iw).round())
-        : longTiles;
-
-    final double srcTileW = iw / cols;
-    final double srcTileH = ih / rows;
-    final double dstTileW = dstW / cols;
-    final double dstTileH = dstH / rows;
-
-    final Paint tilePaint = Paint()..filterQuality = FilterQuality.medium;
-
-    const double tileDur = 0.30;
-    const double maxStart = 1.0 - tileDur;
-
-    for (int r = 0; r < rows; r++) {
-      final double nv = (r + 0.5) / rows - 0.5;
-      for (int c = 0; c < cols; c++) {
-        final double nu = (c + 0.5) / cols - 0.5;
-        final double radial = math.sqrt(nu * nu + nv * nv) / 0.7071;
-        final double h0 = _hash01(c, r, 1);
-        final double h1 = _hash01(c, r, 2);
-        final double h2 = _hash01(c, r, 3);
-        final double h3 = _hash01(c, r, 4);
-
-        final double startT =
-            (radial * 0.42 + h0 * 0.58).clamp(0.0, 1.0) * maxStart;
-        final double localT = ((progress - startT) / tileDur).clamp(0.0, 1.0);
-        if (localT <= 0.001) continue;
-
-        final double eased = Curves.easeOutCubic.transform(localT);
-        final double alpha =
-            ((localT / 0.35).clamp(0.0, 1.0) * masterOpacity).clamp(0.0, 1.0);
-
-        // Slight overlap (+0.6px) prevents hairline seams between settled tiles.
-        final Rect src = Rect.fromLTWH(
-          c * srcTileW,
-          r * srcTileH,
-          srcTileW,
-          srcTileH,
-        );
-        final double targetLeft = ox + c * dstTileW;
-        final double targetTop = oy + r * dstTileH;
-        final double targetCx = targetLeft + dstTileW * 0.5;
-        final double targetCy = targetTop + dstTileH * 0.5;
-
-        tilePaint.color = Color.fromRGBO(255, 255, 255, alpha);
-
-        if (eased >= 0.999) {
-          final Rect dst = Rect.fromLTWH(
-            targetLeft - 0.5,
-            targetTop - 0.5,
-            dstTileW + 1.0,
-            dstTileH + 1.0,
-          );
-          canvas.drawImageRect(image, src, dst, tilePaint);
-        } else {
-          final double inv = 1.0 - eased;
-          final double dx =
-              (targetCx - screenCx) * (0.9 + h1 * 0.9) * inv +
-              (h2 - 0.5) * 140.0 * inv;
-          final double dy =
-              (targetCy - screenCy) * (0.9 + h2 * 0.9) * inv +
-              (h3 - 0.5) * 140.0 * inv;
-          final double scale = 0.25 + 0.75 * eased;
-          final double angle = (h1 - 0.5) * 0.55 * inv;
-
-          canvas.save();
-          canvas.translate(targetCx + dx, targetCy + dy);
-          canvas.rotate(angle);
-          canvas.scale(scale);
-          final Rect localDst = Rect.fromCenter(
-            center: Offset.zero,
-            width: dstTileW + 1.0,
-            height: dstTileH + 1.0,
-          );
-          canvas.drawImageRect(image, src, localDst, tilePaint);
-          canvas.restore();
-        }
-      }
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant _PhotoFlyInPainter old) =>
-      old.image != image ||
-      old.progress != progress ||
-      old.masterOpacity != masterOpacity;
 }
 
 /// Thumbstick for walking on phones without AR tracking.

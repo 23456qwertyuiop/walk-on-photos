@@ -9,8 +9,7 @@ import '../scene/image_utils.dart';
 import '../scene/photo_scene.dart';
 import '../scene/scene_builder.dart';
 
-/// Photo -> AI depth -> layered 3D scene, with lightweight preview image
-/// for the fly-in transition animation.
+/// Photo -> AI depth -> layered 3D scene.
 class SceneLoader extends ChangeNotifier {
   SceneLoader() {
     // Load the model in the background so the first photo is quicker.
@@ -21,13 +20,11 @@ class SceneLoader extends ChangeNotifier {
   final ImagePicker _picker = ImagePicker();
 
   PhotoScene? scene;
-  ui.Image? _previewPhoto;
   bool _busy = false;
   int _sceneVersion = 0;
   String? error;
 
   bool get busy => _busy;
-  ui.Image? get previewPhoto => _previewPhoto;
   int get sceneVersion => _sceneVersion;
 
   /// Opens the gallery / file chooser. Returns true if a new scene was built.
@@ -41,21 +38,16 @@ class SceneLoader extends ChangeNotifier {
   Future<bool> buildFromBytes(Uint8List bytes) async {
     error = null;
     _busy = true;
+    _sceneVersion++;
     notifyListeners();
 
     ui.Image? photo;
     try {
+      // Let the black-screen fade finish painting before running heavy
+      // depth inference / 3D mesh generation (especially on Web).
+      await Future<void>.delayed(const Duration(milliseconds: 240));
+
       photo = await decodePhoto(bytes);
-
-      // Expose a resized preview immediately so the fly-in animation can
-      // start assembling pieces on screen while depth & 3D mesh compute.
-      final ui.Image preview = await resizeImage(photo, 640);
-      final ui.Image? oldPreview = _previewPhoto;
-      _previewPhoto = preview;
-      _sceneVersion++;
-      notifyListeners();
-      oldPreview?.dispose();
-
       final DepthMap depth = await _estimator.estimate(photo);
       final PhotoScene built = await SceneBuilder.build(photo, depth);
 
@@ -77,7 +69,6 @@ class SceneLoader extends ChangeNotifier {
   @override
   void dispose() {
     scene?.dispose();
-    _previewPhoto?.dispose();
     _estimator.dispose();
     super.dispose();
   }

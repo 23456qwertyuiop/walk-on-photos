@@ -216,8 +216,8 @@ class ArPhotoView(
         a.pose.toMatrix(model, 0)
         Matrix.multiplyMM(modelView, 0, view, 0, model, 0)
         Matrix.multiplyMM(mvp, 0, proj, 0, modelView, 0)
-        meshes.forEach { it.draw(mvp) }
         particleRenderer?.draw(mvp, viewportHeight.toFloat() * 0.8f)
+        meshes.forEach { it.draw(mvp) }
     }
 
     /** Photo camera = phone position, facing the phone's heading, level. */
@@ -433,6 +433,7 @@ private class MeshRenderer(private val data: LayerData) {
         )
         GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, 0)
         GLES30.glBindBuffer(GLES30.GL_ELEMENT_ARRAY_BUFFER, 0)
+        GLES30.glDisable(GLES30.GL_BLEND)
 
         // Bitmap row 0 = texture t 0, which matches the top-left uv origin.
         val bitmap = BitmapFactory.decodeByteArray(data.png, 0, data.png.size)
@@ -452,6 +453,8 @@ private class MeshRenderer(private val data: LayerData) {
         if (!uploaded) upload()
         GLES30.glEnable(GLES30.GL_DEPTH_TEST)
         GLES30.glDisable(GLES30.GL_CULL_FACE)
+        GLES30.glEnable(GLES30.GL_BLEND)
+        GLES30.glBlendFunc(GLES30.GL_SRC_ALPHA, GLES30.GL_ONE_MINUS_SRC_ALPHA)
         GLES30.glUseProgram(program)
         GLES30.glUniformMatrix4fv(uMvp, 1, false, mvp, 0)
         GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
@@ -470,6 +473,7 @@ private class MeshRenderer(private val data: LayerData) {
         GLES30.glDisableVertexAttribArray(aUv)
         GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, 0)
         GLES30.glBindBuffer(GLES30.GL_ELEMENT_ARRAY_BUFFER, 0)
+        GLES30.glDisable(GLES30.GL_BLEND)
     }
 
     fun release() {
@@ -522,7 +526,7 @@ private class ParticleRenderer(private val data: ParticleData) {
                 vec2 c = gl_PointCoord - vec2(0.5);
                 float d = length(c);
                 if (d > 0.5) discard;
-                float falloff = smoothstep(0.5, 0.08, d);
+                float falloff = smoothstep(0.5, 0.36, d);
                 fragColor = vec4(v_Color.rgb, v_Color.a * falloff);
             }
             """.trimIndent(),

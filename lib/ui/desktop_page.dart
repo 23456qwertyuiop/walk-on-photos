@@ -113,9 +113,10 @@ class _DesktopPageState extends State<DesktopPage>
                     ),
                   if (loader.scene != null && !loader.busy) ..._hud(context),
                   PhotoFlyInOverlay(
-                    image: loader.previewPhoto,
+                    scene: loader.scene,
                     busy: loader.busy,
                     version: loader.sceneVersion,
+                    hasError: loader.error != null,
                   ),
                 ],
               ),

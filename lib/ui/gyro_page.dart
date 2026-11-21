@@ -177,9 +177,10 @@ class _GyroPageState extends State<GyroPage>
                 ),
               ],
               PhotoFlyInOverlay(
-                image: loader.previewPhoto,
+                scene: loader.scene,
                 busy: loader.busy,
                 version: loader.sceneVersion,
+                hasError: loader.error != null,
               ),
             ],
           ),

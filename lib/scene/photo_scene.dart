@@ -69,6 +69,7 @@ class PhotoScene {
   PhotoScene({
     required this.foreground,
     required this.particles,
+    this.introParticles,
     required this.imageWidth,
     required this.imageHeight,
     required this.focalPx,
@@ -76,6 +77,10 @@ class PhotoScene {
 
   final SceneLayer foreground;
   final ParticleCloud? particles;
+
+  /// Dense 3D surface particles sampled across the reconstructed 3D model,
+  /// used when particles fly into their exact 3D coordinates on entry.
+  final ParticleCloud? introParticles;
 
   /// Size of the source photo in pixels.
   final int imageWidth;

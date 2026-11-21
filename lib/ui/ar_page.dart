@@ -104,9 +104,10 @@ class _ArPageState extends State<ArPage> with WidgetsBindingObserver {
                     child: Center(child: _status(loader)),
                   ),
                 PhotoFlyInOverlay(
-                  image: loader.previewPhoto,
+                  scene: loader.scene,
                   busy: loader.busy,
                   version: loader.sceneVersion,
+                  hasError: loader.error != null,
                 ),
               ],
             );

@@ -175,6 +175,8 @@ final class ArPhotoView: NSObject, FlutterPlatformView, ARSessionDelegate {
     material.diffuse.mipFilter = .linear
     material.lightingModel = .constant
     material.isDoubleSided = true
+    material.blendMode = .alpha
+    material.transparencyMode = .aOne
 
     var uvFloats = [Float](repeating: 0, count: vertexCount * 2)
     uvFloats.withUnsafeMutableBytes { dst in
@@ -225,10 +227,10 @@ final class ArPhotoView: NSObject, FlutterPlatformView, ARSessionDelegate {
       let colorSpace = CGColorSpaceCreateDeviceRGB()
       let colors = [
         UIColor(white: 1.0, alpha: 1.0).cgColor,
-        UIColor(white: 1.0, alpha: 0.72).cgColor,
+        UIColor(white: 1.0, alpha: 0.98).cgColor,
         UIColor(white: 1.0, alpha: 0.0).cgColor,
       ] as CFArray
-      let locations: [CGFloat] = [0.0, 0.45, 1.0]
+      let locations: [CGFloat] = [0.0, 0.78, 0.94]
       if let gradient = CGGradient(colorsSpace: colorSpace, colors: colors, locations: locations) {
         let center = CGPoint(x: 16, y: 16)
         ctx.cgContext.drawRadialGradient(
@@ -284,7 +286,7 @@ final class ArPhotoView: NSObject, FlutterPlatformView, ARSessionDelegate {
       let px = positions[i * 3]
       let py = positions[i * 3 + 1]
       let pz = positions[i * 3 + 2]
-      let r = sizes[i] * 1.15
+      let r = sizes[i] * 0.95
 
       let cr = powf(Float(colorBytes[i * 4]) / 255.0, 2.2)
       let cg = powf(Float(colorBytes[i * 4 + 1]) / 255.0, 2.2)
@@ -356,12 +358,14 @@ final class ArPhotoView: NSObject, FlutterPlatformView, ARSessionDelegate {
     material.isDoubleSided = true
     material.blendMode = .alpha
     material.transparencyMode = .aOne
+    material.blendMode = .alpha
+    material.transparencyMode = .aOne
     material.writesToDepthBuffer = false
     material.readsFromDepthBuffer = true
     geometry.materials = [material]
 
     let node = SCNNode(geometry: geometry)
-    node.renderingOrder = 1
+    node.renderingOrder = -1
     return node
   }
 
@@ -373,40 +377,12 @@ final class ArPhotoView: NSObject, FlutterPlatformView, ARSessionDelegate {
     root.simdPosition = SIMD3<Float>(t.columns.3.x, t.columns.3.y, t.columns.3.z)
     root.simdOrientation = simd_quatf(angle: yaw, axis: SIMD3<Float>(0, 1, 0))
     if root.parent == nil { sceneView.scene.rootNode.addChildNode(root) }
-    animateFlyIn(root)
+    root.removeAllActions()
+    root.opacity = 0.0
+    let fade = SCNAction.fadeIn(duration: 0.35)
+    fade.timingMode = .easeOut
+    root.runAction(fade)
     channel.invokeMethod("onPlaced", arguments: nil)
-  }
-
-  private func animateFlyIn(_ root: SCNNode) {
-    for child in root.childNodes {
-      child.removeAllActions()
-      if let name = child.name, name.hasPrefix("tile_") {
-        let parts = name.split(separator: "_")
-        if parts.count == 3, let col = Int(parts[1]), let row = Int(parts[2]) {
-          let dx = (Float(col) - 2.5) * 0.16
-          let dy = (3.5 - Float(row)) * 0.16
-          let jitter = Float((col * 17 + row * 31) % 7) * 0.06
-          child.opacity = 0.0
-          child.simdPosition = SIMD3<Float>(dx, dy, -0.7 - jitter)
-
-          let dist = sqrtf(powf(Float(col) - 2.5, 2) + powf(Float(row) - 3.5, 2)) / 4.3
-          let delay = Double(dist) * 0.35 + Double((col * 7 + row * 13) % 5) * 0.03
-          let fly = SCNAction.group([
-            SCNAction.fadeIn(duration: 0.38),
-            SCNAction.move(to: SCNVector3Zero, duration: 0.48),
-          ])
-          fly.timingMode = .easeOut
-          child.runAction(SCNAction.sequence([SCNAction.wait(duration: delay), fly]))
-          continue
-        }
-      }
-      if child.name == "particles" {
-        child.opacity = 0.0
-        let fade = SCNAction.fadeIn(duration: 0.55)
-        fade.timingMode = .easeOut
-        child.runAction(SCNAction.sequence([SCNAction.wait(duration: 0.30), fade]))
-      }
-    }
   }
 
   // MARK: ARSessionDelegate (delivered on the main queue)

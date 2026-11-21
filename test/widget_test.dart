@@ -62,32 +62,46 @@ Future<List<int>> _pixel(ui.Image img, int x, int y) async {
 }
 
 void main() {
-  testWidgets('PhotoFlyInOverlay shows flying photo pieces without spinner or text', (
+  testWidgets('PhotoFlyInOverlay loads 3D model first then flies particles to 3D positions without spinner or text', (
     WidgetTester tester,
   ) async {
-    ui.Image? photo;
+    PhotoScene? scene;
+    ui.Image? img;
     await tester.runAsync(() async {
-      photo = await _testPhoto(120, 90);
+      img = await _testPhoto(120, 90);
+      scene = await SceneBuilder.build(
+        img!,
+        _boxDepth(60, 45),
+        options: const SceneBuildOptions(gridLongSide: 32),
+      );
     });
-    await tester.pumpWidget(
-      Directionality(
-        textDirection: TextDirection.ltr,
-        child: PhotoFlyInOverlay(image: photo, busy: true, version: 1),
-      ),
-    );
-    await tester.pump(const Duration(milliseconds: 500));
-    expect(find.byType(CircularProgressIndicator), findsNothing);
-    expect(find.byType(Text), findsNothing);
-    expect(find.byType(CustomPaint), findsOneWidget);
+    expect(scene!.introParticles, isNotNull);
+    expect(scene!.introParticles!.count, greaterThan(0));
 
     await tester.pumpWidget(
       Directionality(
         textDirection: TextDirection.ltr,
-        child: PhotoFlyInOverlay(image: photo, busy: false, version: 1),
+        child: PhotoFlyInOverlay(scene: null, busy: true, version: 1),
       ),
     );
+    await tester.pump(const Duration(milliseconds: 250));
+    expect(find.byType(CircularProgressIndicator), findsNothing);
+    expect(find.byType(Text), findsNothing);
+
+    await tester.pumpWidget(
+      Directionality(
+        textDirection: TextDirection.ltr,
+        child: PhotoFlyInOverlay(scene: scene, busy: false, version: 1),
+      ),
+    );
+    await tester.pump(const Duration(milliseconds: 100));
+    await tester.pump(const Duration(milliseconds: 900));
+    expect(find.byType(CustomPaint), findsOneWidget);
+
+    await tester.pump(const Duration(milliseconds: 3000));
     await tester.pumpAndSettle();
-    photo?.dispose();
+    scene?.dispose();
+    img?.dispose();
   });
 
   testWidgets('desktop UI asks for a photo on an empty background', (
