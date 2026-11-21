@@ -1,0 +1,43 @@
+name: Build iOS
+
+on:
+  workflow_dispatch:
+
+jobs:
+  ios:
+    name: Build iOS (Unsigned IPA)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use patched onnxruntime-swift-package-manager (skip dead onnxruntime_extensions URL)
+        run: |
+          git clone --depth 1 --branch 1.28.0 https://github.com/masicai/onnxruntime-swift-package-manager.git /tmp/ort-spm
+          cp ci/ort-spm/Package.swift /tmp/ort-spm/Package.swift
+          cd /tmp/ort-spm
+          swift package dump-package > /dev/null
+          git config user.name "ci"
+          git config user.email "ci@example.com"
+          git commit -am "CI: drop unused onnxruntime_extensions target"
+          git tag -f 1.28.0
+          git config --global url."file:///tmp/ort-spm".insteadOf "https://github.com/masicai/onnxruntime-swift-package-manager"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - run: flutter pub get
+
+      - run: flutter build ios --release --no-codesign
+
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p dist Payload
+          cp -r build/ios/iphoneos/Runner.app Payload/
+          zip -r -q dist/walk-on-photos-ios-unsigned.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: walk-on-photos-ios-unsigned
+          path: dist/walk-on-photos-ios-unsigned.ipa

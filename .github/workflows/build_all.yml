@@ -128,26 +128,15 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Patch onnxruntime-swift-package-manager (drop dead onnxruntime_extensions URL)
+      - name: Use patched onnxruntime-swift-package-manager (skip dead onnxruntime_extensions URL)
         run: |
           git clone --depth 1 --branch 1.28.0 https://github.com/masicai/onnxruntime-swift-package-manager.git /tmp/ort-spm
+          cp ci/ort-spm/Package.swift /tmp/ort-spm/Package.swift
           cd /tmp/ort-spm
-          python3 - <<'PY'
-          import re
-          with open('Package.swift', 'r') as f:
-              s = f.read()
-          s = re.sub(r'\.library\(name:\s*"onnxruntime_extensions".*?\),\s*', '', s, flags=re.S)
-          s = re.sub(r'\.target\(name:\s*"OnnxRuntimeExtensions".*?\),\s*', '', s, flags=re.S)
-          s = re.sub(r'\.testTarget\(name:\s*"OnnxRuntimeExtensionsTests".*?\),\s*', '', s, flags=re.S)
-          marker = 'if let ext_pod_archive_path'
-          if marker in s:
-              s = s[:s.index(marker)]
-          with open('Package.swift', 'w') as f:
-              f.write(s)
-          PY
+          swift package dump-package > /dev/null
           git config user.name "ci"
           git config user.email "ci@example.com"
-          git commit -am "Drop unused onnxruntime_extensions target"
+          git commit -am "CI: drop unused onnxruntime_extensions target"
           git tag -f 1.28.0
           git config --global url."file:///tmp/ort-spm".insteadOf "https://github.com/masicai/onnxruntime-swift-package-manager"
       - uses: subosito/flutter-action@v2
@@ -172,26 +161,15 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Patch onnxruntime-swift-package-manager (drop dead onnxruntime_extensions URL)
+      - name: Use patched onnxruntime-swift-package-manager (skip dead onnxruntime_extensions URL)
         run: |
           git clone --depth 1 --branch 1.28.0 https://github.com/masicai/onnxruntime-swift-package-manager.git /tmp/ort-spm
+          cp ci/ort-spm/Package.swift /tmp/ort-spm/Package.swift
           cd /tmp/ort-spm
-          python3 - <<'PY'
-          import re
-          with open('Package.swift', 'r') as f:
-              s = f.read()
-          s = re.sub(r'\.library\(name:\s*"onnxruntime_extensions".*?\),\s*', '', s, flags=re.S)
-          s = re.sub(r'\.target\(name:\s*"OnnxRuntimeExtensions".*?\),\s*', '', s, flags=re.S)
-          s = re.sub(r'\.testTarget\(name:\s*"OnnxRuntimeExtensionsTests".*?\),\s*', '', s, flags=re.S)
-          marker = 'if let ext_pod_archive_path'
-          if marker in s:
-              s = s[:s.index(marker)]
-          with open('Package.swift', 'w') as f:
-              f.write(s)
-          PY
+          swift package dump-package > /dev/null
           git config user.name "ci"
           git config user.email "ci@example.com"
-          git commit -am "Drop unused onnxruntime_extensions target"
+          git commit -am "CI: drop unused onnxruntime_extensions target"
           git tag -f 1.28.0
           git config --global url."file:///tmp/ort-spm".insteadOf "https://github.com/masicai/onnxruntime-swift-package-manager"
       - uses: subosito/flutter-action@v2
