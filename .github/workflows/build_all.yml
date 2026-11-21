@@ -53,7 +53,28 @@ jobs:
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev unzip
+      - name: Install ONNX Runtime 1.28.0 from NuGet
+        run: |
+          curl -sL -o /tmp/ort.nupkg \
+            https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.28.0/microsoft.ml.onnxruntime.1.28.0.nupkg
+          unzip -q /tmp/ort.nupkg "build/native/include/*" "runtimes/linux-x64/native/*" -d /tmp/ort
+          sudo cp -r /tmp/ort/build/native/include/* /usr/local/include/
+          sudo cp -r /tmp/ort/runtimes/linux-x64/native/* /usr/local/lib/
+          sudo mkdir -p /usr/local/lib/pkgconfig
+          cat <<'EOF' | sudo tee /usr/local/lib/pkgconfig/onnxruntime.pc
+          prefix=/usr/local
+          libdir=${prefix}/lib
+          includedir=${prefix}/include
+
+          Name: onnxruntime
+          Description: ONNX Runtime
+          Version: 1.28.0
+          Libs: -L${libdir} -lonnxruntime
+          Cflags: -I${includedir}
+          EOF
+          sudo ldconfig
+          rm -rf /tmp/ort /tmp/ort.nupkg
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
@@ -63,6 +84,7 @@ jobs:
       - name: Archive Linux bundle
         run: |
           mkdir -p dist
+          cp /usr/local/lib/libonnxruntime.so* build/linux/x64/release/bundle/lib/
           tar -czf dist/walk-on-photos-linux-x64.tar.gz -C build/linux/x64/release/bundle .
       - uses: actions/upload-artifact@v4
         with:
@@ -74,12 +96,28 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install ONNX Runtime 1.28.0 from NuGet
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.28.0/microsoft.ml.onnxruntime.1.28.0.nupkg" -OutFile "$env:TEMP\ort.zip"
+          Expand-Archive -Path "$env:TEMP\ort.zip" -DestinationPath "$env:TEMP\ort" -Force
+          New-Item -ItemType Directory -Force -Path "C:\onnxruntime\include", "C:\onnxruntime\lib" | Out-Null
+          Copy-Item -Path "$env:TEMP\ort\build\native\include\*" -Destination "C:\onnxruntime\include" -Recurse -Force
+          Copy-Item -Path "$env:TEMP\ort\runtimes\win-x64\native\*" -Destination "C:\onnxruntime\lib" -Recurse -Force
+          Remove-Item -Recurse -Force "$env:TEMP\ort", "$env:TEMP\ort.zip"
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
       - run: flutter pub get
-      - run: flutter build windows --release
+      - name: Build Windows release
+        env:
+          INCLUDE: C:\onnxruntime\include
+          LIB: C:\onnxruntime\lib
+        run: flutter build windows --release
+      - name: Copy ONNX Runtime DLL
+        shell: pwsh
+        run: Copy-Item -Path "C:\onnxruntime\lib\*.dll" -Destination "build\windows\x64\runner\Release\" -Force
       - uses: actions/upload-artifact@v4
         with:
           name: walk-on-photos-windows-x64
